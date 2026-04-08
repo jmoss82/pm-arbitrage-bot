@@ -2,6 +2,12 @@
 
 Cross-platform spread trading engine for **Polymarket** and **Kalshi**. Monitors equivalent markets on both platforms, detects pricing divergences, and is being tuned around short-duration convergence opportunities rather than hold-to-resolution betting.
 
+## Repository
+
+Primary repository for this project:
+
+- [https://github.com/jmoss82/pm-arbitrage-bot](https://github.com/jmoss82/pm-arbitrage-bot)
+
 ## Strategy: Convergence Trading
 
 Both Polymarket and Kalshi offer binary prediction markets on the same real-world events. Because they're separate platforms with separate liquidity pools, the prices for equivalent YES/NO contracts can diverge. When they diverge enough, there's a tradeable spread:
