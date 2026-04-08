@@ -1,0 +1,283 @@
+"""
+Polymarket client wrapper — unifies CLOB order execution, Gamma market lookup,
+and Data API queries behind a single interface for the arbitrage engine.
+"""
+import json
+import logging
+from dataclasses import dataclass, field
+
+import aiohttp
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import (
+    ApiCreds,
+    OrderArgs,
+    BalanceAllowanceParams,
+    AssetType,
+)
+
+import config
+
+logger = logging.getLogger(__name__)
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
+
+
+@dataclass
+class PolymarketMarket:
+    condition_id: str = ""
+    question_id: str = ""
+    question: str = ""
+    slug: str = ""
+    token_yes: str = ""
+    token_no: str = ""
+    price_yes: float | None = None
+    price_no: float | None = None
+    volume: float | None = None
+    liquidity: float | None = None
+    active: bool = False
+    closed: bool = False
+    accepting_orders: bool = False
+    neg_risk: bool = False
+    end_date: str | None = None
+    category: str | None = None
+    _raw: dict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_gamma(cls, d: dict) -> "PolymarketMarket":
+        clob_ids = json.loads(d.get("clobTokenIds", "[]"))
+        outcome_prices = json.loads(d.get("outcomePrices", "[]"))
+        return cls(
+            condition_id=d.get("conditionId", ""),
+            question_id=d.get("questionID", ""),
+            question=d.get("question", ""),
+            slug=d.get("slug", ""),
+            token_yes=clob_ids[0] if len(clob_ids) > 0 else "",
+            token_no=clob_ids[1] if len(clob_ids) > 1 else "",
+            price_yes=float(outcome_prices[0]) if len(outcome_prices) > 0 else None,
+            price_no=float(outcome_prices[1]) if len(outcome_prices) > 1 else None,
+            volume=d.get("volumeNum"),
+            liquidity=d.get("liquidityNum"),
+            active=bool(d.get("active")),
+            closed=bool(d.get("closed")),
+            accepting_orders=bool(d.get("acceptingOrders")),
+            neg_risk=bool(d.get("negRisk")),
+            end_date=d.get("endDate"),
+            category=d.get("groupItemTitle") or d.get("category"),
+            _raw=d,
+        )
+
+
+class PolymarketClient:
+    def __init__(self, derive_keys: bool = True):
+        self.clob = self._init_clob(derive_keys)
+
+    def _init_clob(self, derive_keys: bool) -> ClobClient:
+        if derive_keys and config.POLY_PRIVATE_KEY:
+            logger.info("Deriving Polymarket API credentials (IP-bound)...")
+            l1_client = ClobClient(
+                host=config.CLOB_HOST,
+                chain_id=config.CHAIN_ID,
+                key=config.POLY_PRIVATE_KEY,
+                signature_type=2,
+            )
+            raw_creds = l1_client.derive_api_key()
+
+            if isinstance(raw_creds, dict):
+                api_key = raw_creds.get("apiKey") or raw_creds.get("api_key")
+                api_secret = raw_creds.get("secret") or raw_creds.get("api_secret")
+                api_passphrase = raw_creds.get("passphrase") or raw_creds.get("api_passphrase")
+            else:
+                api_key = raw_creds.api_key
+                api_secret = raw_creds.api_secret
+                api_passphrase = raw_creds.api_passphrase
+
+            logger.info("Polymarket API key derived: %s...", api_key[:16])
+            creds = ApiCreds(api_key, api_secret, api_passphrase)
+        else:
+            creds = ApiCreds(
+                api_key=config.POLY_API_KEY,
+                api_secret=config.POLY_API_SECRET,
+                api_passphrase=config.POLY_API_PASSPHRASE,
+            )
+
+        client = ClobClient(
+            config.CLOB_HOST,
+            key=config.POLY_PRIVATE_KEY,
+            chain_id=config.CHAIN_ID,
+            signature_type=2,
+            funder=config.POLY_FUNDER,
+            creds=creds,
+        )
+        return client
+
+    # ── Market Discovery (Gamma API — async) ─────────────────────────────
+
+    @staticmethod
+    async def fetch_active_markets(
+        session: aiohttp.ClientSession,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PolymarketMarket]:
+        """Fetch active, non-closed markets from the Gamma API."""
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "active": "true",
+            "closed": "false",
+        }
+        async with session.get(f"{GAMMA_API}/markets", params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        return [PolymarketMarket.from_gamma(m) for m in data if m.get("enableOrderBook")]
+
+    @staticmethod
+    async def fetch_market_by_slug(session: aiohttp.ClientSession, slug: str) -> PolymarketMarket | None:
+        async with session.get(f"{GAMMA_API}/markets", params={"slug": slug}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return PolymarketMarket.from_gamma(data[0]) if data else None
+
+    @staticmethod
+    async def fetch_market_by_id(session: aiohttp.ClientSession, condition_id: str) -> PolymarketMarket | None:
+        async with session.get(f"{GAMMA_API}/markets", params={"id": condition_id}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return PolymarketMarket.from_gamma(data[0]) if data else None
+
+    @staticmethod
+    async def search_markets(session: aiohttp.ClientSession, query: str, limit: int = 50) -> list[PolymarketMarket]:
+        """
+        Search Gamma API. Returns markets whose question matches the query.
+        Gamma doesn't have a native text search, so we fetch by volume and filter.
+        """
+        all_markets: list[PolymarketMarket] = []
+        q_lower = query.lower()
+
+        for offset in range(0, 500, 100):
+            batch = await PolymarketClient.fetch_active_markets(session, limit=100, offset=offset)
+            if not batch:
+                break
+            for m in batch:
+                if q_lower in m.question.lower():
+                    all_markets.append(m)
+                    if len(all_markets) >= limit:
+                        return all_markets
+        return all_markets
+
+    @staticmethod
+    async def fetch_all_active_markets(session: aiohttp.ClientSession, max_pages: int = 10) -> list[PolymarketMarket]:
+        """Fetch up to max_pages * 100 active markets sorted by volume."""
+        all_markets: list[PolymarketMarket] = []
+        for page in range(max_pages):
+            batch = await PolymarketClient.fetch_active_markets(session, limit=100, offset=page * 100)
+            if not batch:
+                break
+            all_markets.extend(batch)
+            logger.debug("Fetched page %d: %d markets (total %d)", page, len(batch), len(all_markets))
+        return all_markets
+
+    # ── Order Book (CLOB — sync, via py_clob_client) ─────────────────────
+
+    def get_orderbook(self, token_id: str) -> dict:
+        """Fetch CLOB order book for a given token_id. Returns raw dict."""
+        return self.clob.get_order_book(token_id)
+
+    def get_midpoint(self, token_id: str) -> float | None:
+        """Get midpoint price for a token. Returns decimal (0-1)."""
+        try:
+            mp = self.clob.get_midpoint(token_id)
+            if isinstance(mp, dict):
+                return float(mp.get("mid", 0)) or None
+            return float(mp) if mp else None
+        except Exception:
+            return None
+
+    def get_best_prices(self, token_id: str) -> tuple[float | None, float | None]:
+        """
+        Return (best_bid, best_ask) for a token.
+
+        Many Polymarket markets (especially sports) have sparse standing order
+        books with real depth only at extreme prices.  Market makers fill
+        orders just-in-time instead of posting visible quotes.
+
+        Strategy: use the midpoint from the CLOB as the reference price, then
+        look for the tightest standing bid/ask that bracket it.  If the book is
+        too sparse (spread > 20%), fall back to midpoint +/- a small buffer.
+        """
+        try:
+            mid = self.get_midpoint(token_id)
+
+            book = self.clob.get_order_book(token_id)
+            bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
+            asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
+
+            best_bid = None
+            best_ask = None
+
+            if bids:
+                bp = float(bids[0].price if hasattr(bids[0], "price") else bids[0]["price"])
+                best_bid = bp
+            if asks:
+                ap = float(asks[0].price if hasattr(asks[0], "price") else asks[0]["price"])
+                best_ask = ap
+
+            # If the standing book spread is > 20%, the book is sparse.
+            # Use midpoint as the effective price instead.
+            if best_bid is not None and best_ask is not None:
+                book_spread = best_ask - best_bid
+                if book_spread > 0.20 and mid is not None:
+                    best_bid = mid - 0.005
+                    best_ask = mid + 0.005
+
+            elif mid is not None:
+                best_bid = mid - 0.005
+                best_ask = mid + 0.005
+
+            return best_bid, best_ask
+        except Exception as e:
+            logger.warning("Failed to get prices for %s: %s", token_id[:12], e)
+            return None, None
+
+    # ── Order Execution (CLOB — sync) ────────────────────────────────────
+
+    def buy(self, token_id: str, price: float, size: float) -> dict:
+        return self.clob.create_and_post_order(
+            OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
+        )
+
+    def sell(self, token_id: str, price: float, size: float) -> dict:
+        return self.clob.create_and_post_order(
+            OrderArgs(token_id=token_id, price=price, size=size, side="SELL")
+        )
+
+    def cancel(self, order_id: str):
+        return self.clob.cancel(order_id)
+
+    def get_order(self, order_id: str) -> dict:
+        return self.clob.get_order(order_id)
+
+    # ── Balance / Positions ──────────────────────────────────────────────
+
+    def get_usdc_balance(self) -> float | None:
+        """Return USDC balance in human units."""
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal = self.clob.get_balance_allowance(params)
+            if isinstance(bal, dict):
+                return float(bal.get("balance", "0")) / 1e6
+        except Exception as e:
+            logger.warning("Failed to get USDC balance: %s", e)
+        return None
+
+    @staticmethod
+    async def fetch_positions(session: aiohttp.ClientSession, wallet: str) -> list[dict]:
+        """Fetch current positions from the Data API."""
+        url = f"{DATA_API}/positions"
+        params = {"user": wallet, "limit": 500, "sizeThreshold": 0}
+        async with session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data if isinstance(data, list) else data.get("positions", [])

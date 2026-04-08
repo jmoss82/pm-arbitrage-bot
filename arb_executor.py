@@ -1,0 +1,546 @@
+"""
+Arb executor -- handles entry and exit of spread positions on both platforms.
+
+Entry: buy YES on the cheap platform, buy NO on the expensive platform.
+Exit:  sell YES where we hold it, sell NO where we hold it.
+
+Both entry and exit place orders on both platforms near-simultaneously.
+Supports dry-run mode for paper trading.
+"""
+import logging
+import math
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from kalshi_client import KalshiClient, Order as KalshiOrder
+from polymarket_client import PolymarketClient
+from arb_scanner import SpreadOpportunity, SpreadDirection, _kalshi_book_to_prices
+from position_manager import PositionManager, ArbPosition
+import config
+from trade_logger import log_execution
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TradeResult:
+    action: str  # "entry" or "exit"
+    timestamp: float
+    dry_run: bool
+    contracts: int = 0
+    total_cost_usd: float = 0.0
+
+    poly_success: bool = False
+    poly_error: str | None = None
+    kalshi_success: bool = False
+    kalshi_error: str | None = None
+    poly_order_id: str | None = None
+    kalshi_order_id: str | None = None
+    poly_status: str | None = None
+    kalshi_status: str | None = None
+
+    @property
+    def both_filled(self) -> bool:
+        return self.poly_success and self.kalshi_success
+
+    @property
+    def one_leg_only(self) -> bool:
+        return self.poly_success != self.kalshi_success
+
+    def summary(self) -> str:
+        mode = "[DRY RUN] " if self.dry_run else ""
+        if self.both_filled:
+            return f"{mode}{self.action.upper()} OK: {self.contracts} contracts, ${self.total_cost_usd:.2f}"
+        elif self.one_leg_only:
+            filled = "Poly" if self.poly_success else "Kalshi"
+            failed = "Kalshi" if self.poly_success else "Poly"
+            err = self.kalshi_error if self.poly_success else self.poly_error
+            return f"{mode}{self.action.upper()} PARTIAL: {filled} OK, {failed} FAILED: {err}"
+        else:
+            return f"{mode}{self.action.upper()} FAILED: Poly={self.poly_error} Kalshi={self.kalshi_error}"
+
+
+@dataclass
+class Ledger:
+    entries: list[TradeResult] = field(default_factory=list)
+    exits: list[TradeResult] = field(default_factory=list)
+    daily_spent: float = 0.0
+    _daily_reset_date: str = ""
+
+    def reset_daily_if_needed(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._daily_reset_date:
+            self._daily_reset_date = today
+            self.daily_spent = 0.0
+
+
+class ArbExecutor:
+    def __init__(
+        self,
+        kalshi: KalshiClient,
+        poly: PolymarketClient,
+        position_mgr: PositionManager,
+        dry_run: bool | None = None,
+        max_position_usd: float | None = None,
+        max_daily_spend: float | None = None,
+    ):
+        self.kalshi = kalshi
+        self.poly = poly
+        self.positions = position_mgr
+        self.dry_run = dry_run if dry_run is not None else config.ARB_DRY_RUN
+        self.max_position_usd = max_position_usd or config.ARB_MAX_POSITION_USD
+        self.max_daily_spend = max_daily_spend or config.ARB_MAX_DAILY_SPEND
+        self.ledger = Ledger()
+        self.poly_limit_offset = config.ARB_POLY_LIMIT_OFFSET
+        self.kalshi_limit_offset_cents = config.ARB_KALSHI_LIMIT_OFFSET_CENTS
+        self.allow_partials = config.ARB_ALLOW_PARTIAL_FILLS
+        self.entry_marketable = config.ARB_ENTRY_MARKETABLE
+        self.poly_entry_aggr = config.ARB_POLY_ENTRY_AGGRESSION
+        self.kalshi_entry_aggr_c = config.ARB_KALSHI_ENTRY_AGGRESSION_CENTS
+        self.exit_limit_only = config.ARB_EXIT_LIMIT_ONLY
+        self.poly_exit_passive = config.ARB_POLY_EXIT_PASSIVE_OFFSET
+        self.kalshi_exit_passive_c = config.ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS
+
+    def preflight_check(self) -> tuple[bool, list[str]]:
+        """
+        Validate safety preconditions before live trading.
+        Dry-run always passes.
+        """
+        issues: list[str] = []
+        if self.dry_run:
+            return True, issues
+
+        if not config.live_mode_requested():
+            issues.append("live mode requested but ARB_ENABLE_LIVE is false")
+        if not config.live_mode_armed():
+            issues.append("live mode not armed: ARB_LIVE_CONFIRM token mismatch")
+        if not config.ARB_REQUIRE_BALANCE_CHECK:
+            return len(issues) == 0, issues
+
+        try:
+            bal = self.kalshi.get_balance()
+            kalshi_usd = float(bal.get("balance", 0)) / 100.0
+            if kalshi_usd < config.ARB_MIN_KALSHI_BALANCE_USD:
+                issues.append(
+                    f"kalshi balance ${kalshi_usd:.2f} < ${config.ARB_MIN_KALSHI_BALANCE_USD:.2f}"
+                )
+        except Exception as e:
+            issues.append(f"kalshi balance check failed: {e}")
+
+        try:
+            poly_usdc = self.poly.get_usdc_balance()
+            if poly_usdc is None:
+                issues.append("polymarket balance unavailable")
+            elif poly_usdc < config.ARB_MIN_POLY_BALANCE_USD:
+                issues.append(
+                    f"polymarket balance ${poly_usdc:.2f} < ${config.ARB_MIN_POLY_BALANCE_USD:.2f}"
+                )
+        except Exception as e:
+            issues.append(f"polymarket balance check failed: {e}")
+
+        return len(issues) == 0, issues
+
+    # -- Sizing ----------------------------------------------------------------
+
+    def _compute_entry_size(self, opp: SpreadOpportunity) -> int:
+        cost_per = opp.entry_cost_per_contract
+        if cost_per <= 0:
+            return 0
+
+        max_by_pos = int(self.max_position_usd / cost_per)
+
+        self.ledger.reset_daily_if_needed()
+        remaining = self.max_daily_spend - self.ledger.daily_spent
+        max_by_daily = int(remaining / cost_per)
+
+        contracts = min(max_by_pos, max_by_daily)
+
+        # Platform minimums
+        poly_price = opp.cheap_yes_price if opp.cheap_yes_platform == "polymarket" else opp.expensive_no_price
+        if poly_price > 0 and contracts * poly_price < 1.0:
+            contracts = max(contracts, math.ceil(1.0 / poly_price))
+        contracts = max(contracts, 5)
+
+        total = contracts * cost_per
+        if total > remaining or total > self.max_position_usd:
+            logger.warning("Size after minimums ($%.2f) exceeds limits", total)
+            return 0
+
+        return contracts
+
+    # -- Entry -----------------------------------------------------------------
+
+    def enter(self, opp: SpreadOpportunity) -> TradeResult:
+        """Open a new spread position by buying both legs."""
+        if len(self.positions.positions) >= config.ARB_MAX_OPEN_POSITIONS:
+            return TradeResult(
+                action="entry",
+                timestamp=time.time(),
+                dry_run=self.dry_run,
+                poly_error=f"max open positions reached ({config.ARB_MAX_OPEN_POSITIONS})",
+                kalshi_error=f"max open positions reached ({config.ARB_MAX_OPEN_POSITIONS})",
+            )
+
+        contracts = self._compute_entry_size(opp)
+        result = TradeResult(
+            action="entry", timestamp=time.time(), dry_run=self.dry_run,
+            contracts=contracts, total_cost_usd=contracts * opp.entry_cost_per_contract,
+        )
+
+        if contracts == 0:
+            result.poly_error = result.kalshi_error = "sizing returned 0"
+            self._log_trade_result("entry", result, {"pair": opp.pair.label})
+            return result
+
+        signal_age = time.time() - opp.snapshot.timestamp
+        if signal_age > config.ARB_MAX_SIGNAL_AGE_SECONDS:
+            result.poly_error = f"stale signal ({signal_age:.2f}s)"
+            result.kalshi_error = result.poly_error
+            self._log_trade_result("entry", result, {
+                "pair": opp.pair.label,
+                "signal_age_s": round(signal_age, 3),
+            })
+            return result
+
+        label = opp.pair.label
+        logger.info("ENTER: %s | %s | %d contracts | spread %.4f",
+                     label, opp.direction.value, contracts, opp.spread_width)
+
+        if not self.dry_run:
+            ok, issues = self.preflight_check()
+            if not ok:
+                msg = "; ".join(issues)
+                result.poly_error = msg
+                result.kalshi_error = msg
+                self._log_trade_result("entry", result, {"pair": label, "direction": opp.direction.value})
+                return result
+
+        if self.dry_run:
+            print(f"  [DRY RUN] ENTER {contracts} contracts on {label}")
+            print(f"    Buy YES @ {opp.cheap_yes_price:.4f} on {opp.cheap_yes_platform}")
+            print(f"    Buy NO  @ {opp.expensive_no_price:.4f} on {opp.expensive_no_platform}")
+            print(f"    Spread: {opp.spread_width:.4f} | Cost: ${result.total_cost_usd:.2f}")
+            result.poly_success = result.kalshi_success = True
+            self.ledger.daily_spent += result.total_cost_usd
+            self.positions.open_position(opp, contracts, result.total_cost_usd)
+            self.ledger.entries.append(result)
+            self._log_trade_result("entry", result, {
+                "pair": label,
+                "direction": opp.direction.value,
+                "spread": opp.spread_width,
+                "net_edge": opp.net_edge,
+                "mode": "dry_run",
+            })
+            return result
+
+        # Determine order params for each platform
+        poly_token, poly_price, kalshi_side, kalshi_price_cents = self._entry_params(opp)
+        poly_price = self._entry_poly_price(opp, poly_price)
+        kalshi_price_cents = self._entry_kalshi_price(opp, kalshi_side, kalshi_price_cents)
+
+        # Place Polymarket leg
+        try:
+            poly_result = self._place_poly_with_reprice(
+                side="buy",
+                token_id=poly_token,
+                start_price=poly_price,
+                size=float(contracts),
+            )
+            if isinstance(poly_result, dict) and poly_result.get("success") is False:
+                result.poly_error = poly_result.get("errorMsg") or str(poly_result)
+                result.poly_status = str(poly_result.get("status", "failed"))
+            else:
+                result.poly_success = True
+                if isinstance(poly_result, dict):
+                    result.poly_order_id = (
+                        poly_result.get("orderID")
+                        or poly_result.get("id")
+                        or (poly_result.get("order") or {}).get("id")
+                    )
+                    result.poly_status = str(poly_result.get("status", "posted"))
+        except Exception as e:
+            result.poly_error = str(e)
+            logger.error("Poly entry failed: %s", e)
+
+        # Place Kalshi leg
+        try:
+            order = self.kalshi.create_order(
+                ticker=opp.pair.kalshi_ticker,
+                side=kalshi_side,
+                action="buy",
+                count=contracts,
+                yes_price=kalshi_price_cents if kalshi_side == "yes" else None,
+                no_price=kalshi_price_cents if kalshi_side == "no" else None,
+                client_order_id=f"arb-e-{uuid.uuid4().hex[:8]}",
+            )
+            result.kalshi_success = True
+            result.kalshi_order_id = order.order_id
+            result.kalshi_status = order.status
+        except Exception as e:
+            result.kalshi_error = str(e)
+            logger.error("Kalshi entry failed: %s", e)
+
+        if result.both_filled:
+            self.ledger.daily_spent += result.total_cost_usd
+            self.positions.open_position(opp, contracts, result.total_cost_usd)
+        elif result.one_leg_only:
+            self._warn_partial("ENTRY", label, result)
+            if not self.allow_partials:
+                logger.warning("Partials disabled; no automatic continuation for %s", label)
+
+        self.ledger.entries.append(result)
+        self._log_trade_result("entry", result, {
+            "pair": label,
+            "direction": opp.direction.value,
+            "spread": opp.spread_width,
+            "net_edge": opp.net_edge,
+            "mode": "live",
+            "poly_price": poly_price,
+            "kalshi_price_cents": kalshi_price_cents,
+        })
+        return result
+
+    # -- Exit ------------------------------------------------------------------
+
+    def exit(self, pos: ArbPosition, reason: str = "manual") -> TradeResult:
+        """Close an open spread position by selling both legs."""
+        result = TradeResult(
+            action="exit", timestamp=time.time(), dry_run=self.dry_run,
+            contracts=pos.contracts,
+        )
+
+        label = pos.pair_label
+        logger.info("EXIT [%s]: %s | %d contracts | spread %.4f -> %.4f",
+                     reason, label, pos.contracts, pos.entry_spread, pos.current_spread)
+
+        if self.dry_run:
+            print(f"  [DRY RUN] EXIT {pos.contracts} contracts on {label} (reason: {reason})")
+            print(f"    Entry spread: {pos.entry_spread:.4f} -> Current: {pos.current_spread:.4f}")
+            print(f"    Compression: {pos.spread_compression_pct*100:.0f}%")
+            print(f"    Unrealized P&L: ${pos.unrealized_pnl:+.2f}")
+            result.poly_success = result.kalshi_success = True
+            self.positions.close_position(pos.id, pos.unrealized_pnl, reason=reason)
+            self.ledger.exits.append(result)
+            self._log_trade_result("exit", result, {
+                "pair": label,
+                "reason": reason,
+                "mode": "dry_run",
+                "entry_spread": pos.entry_spread,
+                "current_spread": pos.current_spread,
+            })
+            return result
+
+        # Sell both legs
+        poly_token, kalshi_side = self._exit_params(pos)
+
+        # Sell on Polymarket (limit-first on exit)
+        try:
+            bid, ask = self.poly.get_best_prices(poly_token)
+            sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
+            poly_result = self._place_poly_with_reprice(
+                side="sell",
+                token_id=poly_token,
+                start_price=sell_price,
+                size=float(pos.contracts),
+            )
+            if isinstance(poly_result, dict) and poly_result.get("success") is False:
+                result.poly_error = poly_result.get("errorMsg") or str(poly_result)
+                result.poly_status = str(poly_result.get("status", "failed"))
+            else:
+                result.poly_success = True
+                if isinstance(poly_result, dict):
+                    result.poly_order_id = (
+                        poly_result.get("orderID")
+                        or poly_result.get("id")
+                        or (poly_result.get("order") or {}).get("id")
+                    )
+                    result.poly_status = str(poly_result.get("status", "posted"))
+        except Exception as e:
+            result.poly_error = str(e)
+            logger.error("Poly exit failed: %s", e)
+
+        # Sell on Kalshi (limit-first on exit)
+        try:
+            yes_price, no_price = self._exit_kalshi_limit_prices(pos.kalshi_ticker, kalshi_side)
+            order = self.kalshi.create_order(
+                ticker=pos.kalshi_ticker,
+                side=kalshi_side,
+                action="sell",
+                count=pos.contracts,
+                yes_price=yes_price,
+                no_price=no_price,
+                client_order_id=f"arb-x-{uuid.uuid4().hex[:8]}",
+            )
+            result.kalshi_success = True
+            result.kalshi_order_id = order.order_id
+            result.kalshi_status = order.status
+        except Exception as e:
+            result.kalshi_error = str(e)
+            logger.error("Kalshi exit failed: %s", e)
+
+        if result.both_filled:
+            self.positions.close_position(pos.id, pos.unrealized_pnl, reason=reason)
+        elif result.one_leg_only:
+            self._warn_partial("EXIT", label, result)
+            if not self.allow_partials:
+                logger.warning("Partials disabled; no automatic continuation for %s", label)
+
+        self.ledger.exits.append(result)
+        self._log_trade_result("exit", result, {
+            "pair": label,
+            "reason": reason,
+            "mode": "live",
+            "entry_spread": pos.entry_spread,
+            "current_spread": pos.current_spread,
+            "unrealized_pnl": pos.unrealized_pnl,
+        })
+        return result
+
+    # -- Helpers ---------------------------------------------------------------
+
+    def _entry_params(self, opp: SpreadOpportunity):
+        """Determine per-platform order params for entry."""
+        if opp.direction == SpreadDirection.KALSHI_HIGHER:
+            # Buy YES on Poly, buy NO on Kalshi
+            poly_token = opp.pair.poly.token_yes
+            poly_price = opp.cheap_yes_price
+            kalshi_side = "no"
+            kalshi_price_cents = int(round(opp.expensive_no_price * 100))
+        else:
+            # Buy YES on Kalshi, buy NO on Poly
+            poly_token = opp.pair.poly.token_no
+            poly_price = opp.expensive_no_price
+            kalshi_side = "yes"
+            kalshi_price_cents = int(round(opp.cheap_yes_price * 100))
+        return poly_token, poly_price, kalshi_side, kalshi_price_cents
+
+    def _exit_params(self, pos: ArbPosition):
+        """Determine per-platform order params for exit."""
+        if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
+            # We hold YES on Poly, NO on Kalshi -> sell YES on Poly, sell NO on Kalshi
+            poly_token = pos.poly_token_yes
+            kalshi_side = "no"
+        else:
+            # We hold YES on Kalshi, NO on Poly -> sell NO on Poly, sell YES on Kalshi
+            poly_token = pos.poly_token_no
+            kalshi_side = "yes"
+        return poly_token, kalshi_side
+
+    def _entry_poly_price(self, opp: SpreadOpportunity, fallback_price: float) -> float:
+        if not self.entry_marketable:
+            return max(0.01, min(0.99, fallback_price + self.poly_limit_offset))
+        ask_ref = opp.snapshot.poly_yes_ask
+        if opp.direction == SpreadDirection.POLY_HIGHER:
+            ask_ref = opp.snapshot.poly_no_ask
+        base = ask_ref if ask_ref is not None else fallback_price
+        return max(0.01, min(0.99, base + self.poly_entry_aggr))
+
+    def _entry_kalshi_price(self, opp: SpreadOpportunity, kalshi_side: str, fallback_cents: int) -> int:
+        if not self.entry_marketable:
+            return max(1, min(99, int(fallback_cents + self.kalshi_limit_offset_cents)))
+        if kalshi_side == "yes":
+            ask_ref = opp.snapshot.kalshi_yes_ask
+        else:
+            ask_ref = opp.snapshot.kalshi_no_ask
+        if ask_ref is None:
+            return max(1, min(99, int(fallback_cents + self.kalshi_entry_aggr_c)))
+        return max(1, min(99, int(round(ask_ref * 100)) + self.kalshi_entry_aggr_c))
+
+    def _exit_poly_limit_price(self, bid: float | None, ask: float | None) -> float:
+        # Limit out: target above current bid when possible.
+        base = bid if bid is not None else (ask if ask is not None else 0.01)
+        if self.exit_limit_only:
+            return max(0.01, min(0.99, base + self.poly_exit_passive))
+        return max(0.01, min(0.99, base - self.poly_limit_offset))
+
+    def _exit_kalshi_limit_prices(self, ticker: str, kalshi_side: str) -> tuple[int | None, int | None]:
+        yes_price = None
+        no_price = None
+        try:
+            ob = self.kalshi.get_orderbook(ticker)
+            prices = _kalshi_book_to_prices(ob)
+            if kalshi_side == "yes":
+                bid_ref = prices.get("yes_bid")
+                if bid_ref is not None:
+                    px = int(round(bid_ref * 100))
+                    yes_price = max(1, min(99, px + self.kalshi_exit_passive_c))
+            else:
+                bid_ref = prices.get("no_bid")
+                if bid_ref is not None:
+                    px = int(round(bid_ref * 100))
+                    no_price = max(1, min(99, px + self.kalshi_exit_passive_c))
+        except Exception:
+            pass
+        return yes_price, no_price
+
+    def _log_trade_result(self, action: str, result: TradeResult, context: dict):
+        try:
+            log_execution({
+                "action": action,
+                "dry_run": result.dry_run,
+                "contracts": result.contracts,
+                "total_cost_usd": result.total_cost_usd,
+                "poly_success": result.poly_success,
+                "poly_error": result.poly_error,
+                "poly_order_id": result.poly_order_id,
+                "poly_status": result.poly_status,
+                "kalshi_success": result.kalshi_success,
+                "kalshi_error": result.kalshi_error,
+                "kalshi_order_id": result.kalshi_order_id,
+                "kalshi_status": result.kalshi_status,
+                "context": context,
+            })
+        except Exception as e:
+            logger.warning("Failed to write execution log: %s", e)
+
+    def _place_poly_with_reprice(
+        self,
+        side: str,
+        token_id: str,
+        start_price: float,
+        size: float,
+    ) -> dict:
+        """
+        Place a Polymarket order with optional repricing attempts.
+        """
+        attempts = max(0, config.ARB_ORDER_REPRICE_ATTEMPTS)
+        price = start_price
+        last_result: dict = {}
+        for attempt in range(attempts + 1):
+            if side == "buy":
+                last_result = self.poly.buy(token_id, price, size)
+            else:
+                last_result = self.poly.sell(token_id, price, size)
+
+            if not (isinstance(last_result, dict) and last_result.get("success") is False):
+                return last_result
+
+            if attempt >= attempts:
+                return last_result
+
+            step = 0.005
+            if side == "buy":
+                price = max(0.01, min(0.99, price + step))
+            else:
+                price = max(0.01, min(0.99, price - step))
+            time.sleep(min(1, config.ARB_ORDER_TIMEOUT_SECONDS))
+        return last_result
+
+    def _warn_partial(self, action: str, label: str, result: TradeResult):
+        logger.warning("PARTIAL %s on %s - manual intervention may be needed", action, label)
+        print(f"  *** WARNING: Partial {action} on {label} ***")
+        print(f"      Poly: {'OK' if result.poly_success else result.poly_error}")
+        print(f"      Kalshi: {'OK' if result.kalshi_success else result.kalshi_error}")
+
+    def print_ledger(self):
+        l = self.ledger
+        entries_ok = sum(1 for t in l.entries if t.both_filled)
+        exits_ok = sum(1 for t in l.exits if t.both_filled)
+        print(f"\n  Session Ledger")
+        print(f"  --------------------------------")
+        print(f"  Entries:  {entries_ok}/{len(l.entries)} successful")
+        print(f"  Exits:    {exits_ok}/{len(l.exits)} successful")
+        print(f"  Daily spent: ${l.daily_spent:.2f} / ${self.max_daily_spend:.2f}")
+        print(f"  Open positions: {len(self.positions.positions)}")

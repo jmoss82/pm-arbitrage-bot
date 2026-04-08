@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: prediction-market-arb
+    env: docker
+    autoDeploy: true
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ARB_DRY_RUN
+        value: "true"
+      - key: ARB_ENABLE_LIVE
+        value: "false"
+      - key: LOG_LEVEL
+        value: "INFO"
