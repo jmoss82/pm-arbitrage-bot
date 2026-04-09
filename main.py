@@ -106,6 +106,30 @@ def _print_runtime_mode_banner(mode_label: str):
         print("  !!! LIVE MODE ARMED !!!")
 
 
+def _fmt_px(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "-"
+
+
+def _btc_diag_line(snap, opp) -> str:
+    mid_spread = snap.mid_spread
+    parts = [
+        f"K y {_fmt_px(snap.kalshi_yes_bid)}/{_fmt_px(snap.kalshi_yes_ask)}",
+        f"P y {_fmt_px(snap.poly_yes_bid)}/{_fmt_px(snap.poly_yes_ask)}",
+        f"mid {_fmt_px(mid_spread)}",
+    ]
+    if opp:
+        parts.extend([
+            f"dir {opp.direction.value}",
+            f"gross {opp.spread_width:.3f}",
+            f"net {opp.net_edge:.3f}",
+            f"k_qty {opp.kalshi_leg_available_qty if opp.kalshi_leg_available_qty is not None else '-'}",
+        ])
+    else:
+        parts.append("gross -")
+        parts.append("net -")
+    return " | ".join(parts)
+
+
 def _preflight_or_raise(executor: ArbExecutor, mode_label: str):
     ok, issues = executor.preflight_check()
     if ok:
@@ -475,11 +499,15 @@ async def cmd_monitor(args):
                     pair_count = 1 if config.ARB_BTC15_ONLY else len(tradeable)
                     print(f"  [{ts}] Scan #{scan_count}: no new spreads "
                           f"({pair_count} pair, {open_count} open positions)")
+                    if config.ARB_BTC15_ONLY and btc_pair:
+                        print(f"      {_btc_diag_line(snap, single)}")
             elif scan_count % 12 == 1:
                 open_count = len(pos_mgr.positions)
                 pair_count = 1 if config.ARB_BTC15_ONLY else len(tradeable)
                 print(f"  [{ts}] Scan #{scan_count}: no new spreads "
                       f"({pair_count} pair, {open_count} open positions)")
+                if config.ARB_BTC15_ONLY and btc_pair:
+                    print(f"      {_btc_diag_line(snap, single)}")
 
             await asyncio.sleep(interval)
 
