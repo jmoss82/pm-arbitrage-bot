@@ -42,6 +42,8 @@ def setup_logging():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     sys.stdout.reconfigure(errors="replace")
     sys.stderr.reconfigure(errors="replace")
     kalshi_cfg = config.kalshi_config_summary()
