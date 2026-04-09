@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+import config
 from kalshi_client import KalshiClient, Orderbook
 from polymarket_client import PolymarketClient
 from market_matcher import MarketPair
@@ -136,7 +137,7 @@ def estimate_round_trip_fees(
     no_profit = max(0, exit_no_price - entry_no_price)
     no_fee = no_rate * no_profit
 
-    return yes_fee + no_fee
+    return yes_fee + no_fee + config.ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE
 
 
 def estimate_entry_exit_fees_simple(spread_width: float, yes_platform: str) -> float:
@@ -147,7 +148,7 @@ def estimate_entry_exit_fees_simple(spread_width: float, yes_platform: str) -> f
     yes_rate = POLY_FEE_RATE if yes_platform == "polymarket" else KALSHI_FEE_RATE
     no_rate = KALSHI_FEE_RATE if yes_platform == "polymarket" else POLY_FEE_RATE
     avg_rate = (yes_rate + no_rate) / 2
-    return avg_rate * spread_width
+    return (avg_rate * spread_width) + config.ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE
 
 
 # -- Price fetching (unchanged from before) ------------------------------------

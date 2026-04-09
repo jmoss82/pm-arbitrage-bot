@@ -159,7 +159,7 @@ All settings in `.env`:
 | `ARB_REQUIRE_BALANCE_CHECK` | `true` | Enforce account balance checks before live trading. |
 | `ARB_MIN_KALSHI_BALANCE_USD` | `25.0` | Minimum Kalshi cash required for live preflight. |
 | `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket USDC required for live preflight. |
-| `ARB_MAX_OPEN_POSITIONS` | `5` | Cap concurrent open arb positions. |
+| `ARB_MAX_OPEN_POSITIONS` | `1` | Cap concurrent open arb positions. |
 
 ### BTC 15-minute entry controls
 
@@ -189,6 +189,7 @@ All settings in `.env`:
 | `ARB_EXIT_LIMIT_ONLY` | `true` | Keep exits limit-first by default. |
 | `ARB_POLY_EXIT_PASSIVE_OFFSET` | `0.01` | Passive premium above bid for Poly exit limits. |
 | `ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS` | `1` | Passive premium above bid for Kalshi exit limits. |
+| `ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE` | `0.01` | Additional fixed friction buffer added to round-trip cost estimates. |
 
 ## Current paper-trading profile
 
@@ -196,9 +197,10 @@ Current local `.env` tuning for conservative dry-run validation:
 
 - `ARB_BTC15_ONLY=true`
 - `ARB_SCAN_INTERVAL=2`
-- `ARB_MIN_EDGE=0.02`
+- `ARB_MIN_EDGE=0.05`
 - `ARB_MAX_POSITION_USD=5.0`
 - `ARB_MAX_DAILY_SPEND=25.0`
+- `ARB_MAX_OPEN_POSITIONS=1`
 - Entry style: marketable-limit in (`ARB_ENTRY_MARKETABLE=true`)
 - Exit style: limit-first out (`ARB_EXIT_LIMIT_ONLY=true`)
 
@@ -249,7 +251,7 @@ Use these for dry-run acceptance gates before enabling live mode.
 
 ## Fee Model (Round-Trip)
 
-Fees are estimated for the full round trip: entry + exit, no resolution.
+Fees are estimated for the full round trip: entry + exit, no resolution. The runtime estimate also includes a configurable fixed slippage/fill-risk buffer via `ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE`.
 
 | Platform | Fee Rate | Applied to |
 |---|---|---|

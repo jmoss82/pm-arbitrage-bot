@@ -57,7 +57,7 @@ ARB_REQUIRE_BALANCE_CHECK = os.getenv("ARB_REQUIRE_BALANCE_CHECK", "true").lower
 )
 ARB_MIN_KALSHI_BALANCE_USD = float(os.getenv("ARB_MIN_KALSHI_BALANCE_USD", "25.0"))
 ARB_MIN_POLY_BALANCE_USD = float(os.getenv("ARB_MIN_POLY_BALANCE_USD", "25.0"))
-ARB_MAX_OPEN_POSITIONS = int(os.getenv("ARB_MAX_OPEN_POSITIONS", "5"))
+ARB_MAX_OPEN_POSITIONS = int(os.getenv("ARB_MAX_OPEN_POSITIONS", "1"))
 
 # BTC 15-minute strategy controls
 ARB_BTC15_TIME_GATING = os.getenv("ARB_BTC15_TIME_GATING", "true").lower() in (
@@ -91,6 +91,7 @@ ARB_EXIT_LIMIT_ONLY = os.getenv("ARB_EXIT_LIMIT_ONLY", "true").lower() in (
 )
 ARB_POLY_EXIT_PASSIVE_OFFSET = float(os.getenv("ARB_POLY_EXIT_PASSIVE_OFFSET", "0.01"))
 ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS = int(os.getenv("ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS", "1"))
+ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE = float(os.getenv("ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE", "0.01"))
 
 # ── Logging ─────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

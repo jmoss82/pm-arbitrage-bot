@@ -132,6 +132,14 @@ def _btc_diag_line(snap, opp) -> str:
     return " | ".join(parts)
 
 
+def _position_status_line(pos) -> str:
+    return (
+        f"{pos.pair_label} | dir {pos.direction} | spread {pos.current_spread:.3f} "
+        f"| target {pos.target_exit_spread:.3f} | stop {pos.stop_loss_spread:.3f} "
+        f"| pnl ${pos.unrealized_pnl:+.2f}"
+    )
+
+
 def _preflight_or_raise(executor: ArbExecutor, mode_label: str):
     ok, issues = executor.preflight_check()
     if ok:
@@ -414,6 +422,10 @@ async def cmd_monitor(args):
                     if executor:
                         result = executor.exit(pos, reason)
                         print(f"    > {result.summary()}")
+                if (not exit_signals) and scan_count % 6 == 1:
+                    for pos in pos_mgr.positions.values():
+                        if pos.status == "open":
+                            print(f"  [{ts}] Tracking exit: {_position_status_line(pos)}")
 
             # 2. Scan for new entry opportunities
             if config.ARB_BTC15_ONLY:
