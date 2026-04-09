@@ -1,7 +1,30 @@
 import os
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _strip_wrapping_quotes(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _kalshi_default_urls() -> tuple[str, str]:
+    env = os.getenv("KALSHI_ENV", "").strip().lower()
+    if env in ("demo", "paper", "sandbox", "test", "elections"):
+        return (
+            "https://api.elections.kalshi.com/trade-api/v2",
+            "wss://api.elections.kalshi.com/trade-api/ws/v2",
+        )
+    return (
+        "https://trading-api.kalshi.com/trade-api/v2",
+        "wss://trading-api.kalshi.com/trade-api/ws/v2",
+    )
 
 # ── Polymarket ──────────────────────────────────────────────
 POLY_API_KEY = os.getenv("POLY_API_KEY")
@@ -14,10 +37,12 @@ CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 
 # ── Kalshi ──────────────────────────────────────────────────
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+KALSHI_PRIVATE_KEY_PEM = _strip_wrapping_quotes(os.getenv("KALSHI_PRIVATE_KEY_PEM"))
+KALSHI_PRIVATE_KEY_BASE64 = _strip_wrapping_quotes(os.getenv("KALSHI_PRIVATE_KEY_BASE64"))
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
-KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://trading-api.kalshi.com/trade-api/v2")
-KALSHI_WS_URL = os.getenv("KALSHI_WS_URL", "wss://trading-api.kalshi.com/trade-api/ws/v2")
+_DEFAULT_KALSHI_BASE_URL, _DEFAULT_KALSHI_WS_URL = _kalshi_default_urls()
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", _DEFAULT_KALSHI_BASE_URL)
+KALSHI_WS_URL = os.getenv("KALSHI_WS_URL", _DEFAULT_KALSHI_WS_URL)
 
 # ── Arbitrage Engine ───────────────────────────────────────
 ARB_SCAN_INTERVAL = int(os.getenv("ARB_SCAN_INTERVAL", "5"))
@@ -75,10 +100,34 @@ def resolve_kalshi_pem() -> str | None:
     """Return the Kalshi private key PEM string, loading from file if needed."""
     if KALSHI_PRIVATE_KEY_PEM:
         return KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n")
+    if KALSHI_PRIVATE_KEY_BASE64:
+        decoded = base64.b64decode(KALSHI_PRIVATE_KEY_BASE64).decode()
+        return _strip_wrapping_quotes(decoded)
     if KALSHI_PRIVATE_KEY_PATH:
         with open(KALSHI_PRIVATE_KEY_PATH, "r") as f:
             return f.read()
     return None
+
+
+def kalshi_config_summary() -> dict[str, str | bool]:
+    pem = resolve_kalshi_pem()
+    base_url = KALSHI_BASE_URL
+    env_name = "demo" if "elections.kalshi.com" in base_url else "prod"
+    return {
+        "env": env_name,
+        "base_url": base_url,
+        "has_api_key": bool(KALSHI_API_KEY_ID),
+        "has_private_key": bool(pem),
+        "private_key_source": (
+            "pem"
+            if KALSHI_PRIVATE_KEY_PEM
+            else "base64"
+            if KALSHI_PRIVATE_KEY_BASE64
+            else "path"
+            if KALSHI_PRIVATE_KEY_PATH
+            else "missing"
+        ),
+    }
 
 
 def live_mode_requested() -> bool:

@@ -105,6 +105,13 @@ pip install -r requirements.txt
 
 Copy `.env.example` to `.env` and fill in credentials from both platforms. Polymarket API keys are IP-bound and get derived at runtime from your private key.
 
+For Kalshi, make sure the key and base URL point at the same environment:
+
+- `KALSHI_ENV=prod` -> `https://trading-api.kalshi.com/trade-api/v2`
+- `KALSHI_ENV=demo` -> `https://api.elections.kalshi.com/trade-api/v2`
+
+In Railway, prefer `KALSHI_PRIVATE_KEY_BASE64` or a single-line `KALSHI_PRIVATE_KEY_PEM` with literal `\n` escapes. Multiline PEM pastes are easy to mangle in hosted env UIs.
+
 ## Usage
 
 ```bash

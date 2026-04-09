@@ -44,6 +44,15 @@ def setup_logging():
     )
     sys.stdout.reconfigure(errors="replace")
     sys.stderr.reconfigure(errors="replace")
+    kalshi_cfg = config.kalshi_config_summary()
+    logger.info(
+        "Kalshi config: env=%s base_url=%s api_key=%s private_key=%s source=%s",
+        kalshi_cfg["env"],
+        kalshi_cfg["base_url"],
+        "set" if kalshi_cfg["has_api_key"] else "missing",
+        "set" if kalshi_cfg["has_private_key"] else "missing",
+        kalshi_cfg["private_key_source"],
+    )
 
 
 def _header(title: str):
