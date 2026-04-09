@@ -174,6 +174,15 @@ class ArbExecutor:
 
     def enter(self, opp: SpreadOpportunity) -> TradeResult:
         """Open a new spread position by buying both legs."""
+        if self.positions.has_open_position(opp.pair.kalshi_ticker, opp.direction.value):
+            return TradeResult(
+                action="entry",
+                timestamp=time.time(),
+                dry_run=self.dry_run,
+                poly_error="matching position already open",
+                kalshi_error="matching position already open",
+            )
+
         if len(self.positions.positions) >= config.ARB_MAX_OPEN_POSITIONS:
             return TradeResult(
                 action="entry",

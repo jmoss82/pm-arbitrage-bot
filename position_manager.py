@@ -139,6 +139,15 @@ class PositionManager:
                      pos_id, opp.pair.label, contracts, opp.spread_width)
         return pos
 
+    def has_open_position(self, kalshi_ticker: str, direction: str) -> bool:
+        """Return True when an equivalent position is already open."""
+        for pos in self.positions.values():
+            if pos.status != "open":
+                continue
+            if pos.kalshi_ticker == kalshi_ticker and pos.direction == direction:
+                return True
+        return False
+
     # -- Spread monitoring -----------------------------------------------------
 
     def update_position(self, pos: ArbPosition, snapshot: PriceSnapshot):

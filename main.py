@@ -447,7 +447,8 @@ async def cmd_monitor(args):
                     keys_this_scan.add(key)
                     timing_ok, timing_reason = _entry_timing_allowed(opp.pair.label)
                     quality_ok, quality_reason = _opportunity_passes_quality_filters(opp)
-                    if not (timing_ok and quality_ok):
+                    already_open = pos_mgr.has_open_position(opp.pair.kalshi_ticker, opp.direction.value)
+                    if not (timing_ok and quality_ok) or already_open:
                         entry_streaks[key] = 0
                         log_signal({
                             "pair": opp.pair.label,
@@ -456,7 +457,11 @@ async def cmd_monitor(args):
                             "spread_width": round(opp.spread_width, 6),
                             "net_edge": round(opp.net_edge, 6),
                             "accepted": False,
-                            "reason": timing_reason if not timing_ok else quality_reason,
+                            "reason": (
+                                "matching-position-open"
+                                if already_open
+                                else timing_reason if not timing_ok else quality_reason
+                            ),
                         })
                         continue
 
