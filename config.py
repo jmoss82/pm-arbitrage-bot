@@ -27,10 +27,6 @@ ARB_MAX_POSITION_USD = float(os.getenv("ARB_MAX_POSITION_USD", "50.0"))
 ARB_MAX_DAILY_SPEND = float(os.getenv("ARB_MAX_DAILY_SPEND", "500.0"))
 ARB_DRY_RUN = os.getenv("ARB_DRY_RUN", "true").lower() in ("true", "1", "yes")
 ARB_ENABLE_LIVE = os.getenv("ARB_ENABLE_LIVE", "false").lower() in ("true", "1", "yes")
-ARB_LIVE_CONFIRM_EXPECTED = os.getenv(
-    "ARB_LIVE_CONFIRM_EXPECTED", "I_UNDERSTAND_LIVE_TRADING_RISK"
-)
-ARB_LIVE_CONFIRM = os.getenv("ARB_LIVE_CONFIRM", "")
 ARB_REQUIRE_BALANCE_CHECK = os.getenv("ARB_REQUIRE_BALANCE_CHECK", "true").lower() in (
     "true", "1", "yes"
 )
@@ -96,8 +92,6 @@ def live_mode_requested() -> bool:
 
 def live_mode_armed() -> bool:
     """
-    Live mode is armed only when the explicit confirmation token matches.
+    Live mode is armed when both ARB_DRY_RUN=false and ARB_ENABLE_LIVE=true.
     """
-    if not live_mode_requested():
-        return False
-    return ARB_LIVE_CONFIRM.strip() == ARB_LIVE_CONFIRM_EXPECTED.strip()
+    return live_mode_requested()

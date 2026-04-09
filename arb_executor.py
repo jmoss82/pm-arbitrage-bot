@@ -115,7 +115,7 @@ class ArbExecutor:
         if not config.live_mode_requested():
             issues.append("live mode requested but ARB_ENABLE_LIVE is false")
         if not config.live_mode_armed():
-            issues.append("live mode not armed: ARB_LIVE_CONFIRM token mismatch")
+            issues.append("live mode not armed: set ARB_DRY_RUN=false and ARB_ENABLE_LIVE=true")
         if not config.ARB_REQUIRE_BALANCE_CHECK:
             return len(issues) == 0, issues
 

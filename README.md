@@ -149,8 +149,6 @@ All settings in `.env`:
 | `ARB_MAX_DAILY_SPEND` | `500.0` | Daily spend cap across all entries |
 | `ARB_DRY_RUN` | `true` | Paper trading mode. Keep `true` during calibration. |
 | `ARB_ENABLE_LIVE` | `false` | Additional hard gate. Live only allowed when this is true. |
-| `ARB_LIVE_CONFIRM_EXPECTED` | `I_UNDERSTAND_LIVE_TRADING_RISK` | Required confirmation token value. |
-| `ARB_LIVE_CONFIRM` | _(empty)_ | Must exactly match `ARB_LIVE_CONFIRM_EXPECTED` to arm live mode. |
 | `ARB_REQUIRE_BALANCE_CHECK` | `true` | Enforce account balance checks before live trading. |
 | `ARB_MIN_KALSHI_BALANCE_USD` | `25.0` | Minimum Kalshi cash required for live preflight. |
 | `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket USDC required for live preflight. |
@@ -203,8 +201,7 @@ Live execution is fail-closed. The bot only sends live orders when all are true:
 
 1. `ARB_DRY_RUN=false`
 2. `ARB_ENABLE_LIVE=true`
-3. `ARB_LIVE_CONFIRM` exactly equals `ARB_LIVE_CONFIRM_EXPECTED`
-4. Live preflight checks pass (balances, guardrails)
+3. Live preflight checks pass (balances, guardrails)
 
 If any check fails, monitor/execute mode aborts with a preflight error.
 
