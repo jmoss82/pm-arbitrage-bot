@@ -428,6 +428,12 @@ async def cmd_monitor(args):
                             print(f"  [{ts}] Tracking exit: {_position_status_line(pos)}")
 
             # 2. Scan for new entry opportunities
+            if executor and executor.emergency_stop:
+                if scan_count % 12 == 1:
+                    print(f"  [{ts}] ENTRY HALTED: {executor.emergency_reason}")
+                await asyncio.sleep(interval)
+                continue
+
             if config.ARB_BTC15_ONLY:
                 ids = _btc15_market_ids()
                 if ids["window_key"] != btc_window_key or btc_pair is None or scan_count % 8 == 1:

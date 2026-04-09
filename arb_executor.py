@@ -102,6 +102,8 @@ class ArbExecutor:
         self.exit_limit_only = config.ARB_EXIT_LIMIT_ONLY
         self.poly_exit_passive = config.ARB_POLY_EXIT_PASSIVE_OFFSET
         self.kalshi_exit_passive_c = config.ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS
+        self.emergency_stop = False
+        self.emergency_reason: str | None = None
 
     def preflight_check(self) -> tuple[bool, list[str]]:
         """
@@ -174,6 +176,15 @@ class ArbExecutor:
 
     def enter(self, opp: SpreadOpportunity) -> TradeResult:
         """Open a new spread position by buying both legs."""
+        if self.emergency_stop:
+            return TradeResult(
+                action="entry",
+                timestamp=time.time(),
+                dry_run=self.dry_run,
+                poly_error=self.emergency_reason or "emergency stop active",
+                kalshi_error=self.emergency_reason or "emergency stop active",
+            )
+
         if self.positions.has_open_position(opp.pair.kalshi_ticker, opp.direction.value):
             return TradeResult(
                 action="entry",
@@ -297,7 +308,7 @@ class ArbExecutor:
         elif result.one_leg_only:
             self._warn_partial("ENTRY", label, result)
             if not self.allow_partials:
-                logger.warning("Partials disabled; no automatic continuation for %s", label)
+                self._handle_entry_partial(opp, contracts, result)
 
         self.ledger.entries.append(result)
         self._log_trade_result("entry", result, {
@@ -394,7 +405,7 @@ class ArbExecutor:
         elif result.one_leg_only:
             self._warn_partial("EXIT", label, result)
             if not self.allow_partials:
-                logger.warning("Partials disabled; no automatic continuation for %s", label)
+                self._handle_exit_partial(pos, result)
 
         self.ledger.exits.append(result)
         self._log_trade_result("exit", result, {
@@ -542,6 +553,72 @@ class ArbExecutor:
         print(f"  *** WARNING: Partial {action} on {label} ***")
         print(f"      Poly: {'OK' if result.poly_success else result.poly_error}")
         print(f"      Kalshi: {'OK' if result.kalshi_success else result.kalshi_error}")
+
+    def _trip_emergency_stop(self, reason: str):
+        self.emergency_stop = True
+        self.emergency_reason = reason
+        logger.error("EMERGENCY STOP: %s", reason)
+        print(f"  *** EMERGENCY STOP: {reason} ***")
+        print("      New entries are disabled until the process is restarted.")
+
+    def _handle_entry_partial(self, opp: SpreadOpportunity, contracts: int, result: TradeResult):
+        logger.warning("Partials disabled; attempting emergency flatten for entry on %s", opp.pair.label)
+        if result.poly_success and not result.kalshi_success:
+            poly_token, _, _, _ = self._entry_params(opp)
+            self._emergency_flatten_poly(poly_token, contracts)
+        elif result.kalshi_success and not result.poly_success:
+            _, _, kalshi_side, _ = self._entry_params(opp)
+            self._emergency_flatten_kalshi(opp.pair.kalshi_ticker, kalshi_side, contracts)
+        self._trip_emergency_stop(f"partial entry on {opp.pair.label}")
+
+    def _handle_exit_partial(self, pos: ArbPosition, result: TradeResult):
+        logger.warning("Partials disabled; attempting emergency flatten for exit on %s", pos.pair_label)
+        poly_token, kalshi_side = self._exit_params(pos)
+        if result.poly_success and not result.kalshi_success:
+            self._emergency_flatten_kalshi(pos.kalshi_ticker, kalshi_side, pos.contracts)
+        elif result.kalshi_success and not result.poly_success:
+            self._emergency_flatten_poly(poly_token, pos.contracts)
+        self._trip_emergency_stop(f"partial exit on {pos.pair_label}")
+
+    def _emergency_flatten_poly(self, token_id: str, contracts: int):
+        try:
+            bid, ask = self.poly.get_best_prices(token_id)
+            ref = bid if bid is not None else (ask if ask is not None else 0.01)
+            price = max(0.01, min(0.99, ref - 0.01))
+            self.poly.sell(token_id, price, float(contracts))
+            logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=%.4f", token_id, contracts, price)
+            print(f"      Emergency Poly flatten submitted @ {price:.4f}")
+        except Exception as e:
+            logger.error("Emergency Poly flatten failed: %s", e)
+            print(f"      Emergency Poly flatten failed: {e}")
+
+    def _emergency_flatten_kalshi(self, ticker: str, side: str, contracts: int):
+        try:
+            ob = self.kalshi.get_orderbook(ticker)
+            prices = _kalshi_book_to_prices(ob)
+            yes_price = no_price = None
+            if side == "yes":
+                bid_ref = prices.get("yes_bid")
+                px = int(round((bid_ref or 0.01) * 100))
+                yes_price = max(1, min(99, px))
+            else:
+                bid_ref = prices.get("no_bid")
+                px = int(round((bid_ref or 0.01) * 100))
+                no_price = max(1, min(99, px))
+            self.kalshi.create_order(
+                ticker=ticker,
+                side=side,
+                action="sell",
+                count=contracts,
+                yes_price=yes_price,
+                no_price=no_price,
+                client_order_id=f"arb-emerg-{uuid.uuid4().hex[:8]}",
+            )
+            logger.warning("Emergency Kalshi flatten submitted: ticker=%s side=%s count=%s", ticker, side, contracts)
+            print(f"      Emergency Kalshi flatten submitted on {ticker} ({side})")
+        except Exception as e:
+            logger.error("Emergency Kalshi flatten failed: %s", e)
+            print(f"      Emergency Kalshi flatten failed: {e}")
 
     def print_ledger(self):
         l = self.ledger

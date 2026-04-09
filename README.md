@@ -289,3 +289,5 @@ These thresholds are configurable. The target/stop percentages are set in the `P
 | **Matching** | False positive on different events | Manual pair verification before live; entity-aware scoring |
 
 **Always start with `ARB_DRY_RUN=true`** and validate matching, pricing, and exit signals before committing real capital.
+
+Live safeguard note: when `ARB_ALLOW_PARTIAL_FILLS=false`, a one-sided live fill now triggers an emergency stop, attempts a best-effort flatten of the exposed leg, and blocks new entries until restart.
