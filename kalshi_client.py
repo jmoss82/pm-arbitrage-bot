@@ -327,6 +327,11 @@ class KalshiClient:
         raw = self._paginate("GET", "/portfolio/orders", "orders", params)
         return [Order.from_dict(o) for o in raw]
 
+    def get_order(self, order_id: str) -> Order | None:
+        data = self._request("GET", f"/portfolio/orders/{order_id}")
+        order = data.get("order")
+        return Order.from_dict(order) if order else None
+
     # ── Order Management ─────────────────────────────────────────────────
 
     def create_order(

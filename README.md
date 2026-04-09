@@ -169,6 +169,7 @@ All settings in `.env`:
 | `ARB_ENTRY_MIN_SECONDS_IN_WINDOW` | `45` | Do not enter too early in a fresh 15m window. |
 | `ARB_ENTRY_MAX_SECONDS_IN_WINDOW` | `780` | Stop entering near window end (avoid stale/late trades). |
 | `ARB_ENTRY_COOLDOWN_SECONDS_AFTER_ROLLOVER` | `20` | Cooldown right after rollover before new entries. |
+| `ARB_FORCE_EXIT_SECONDS_REMAINING` | `180` | Force BTC exits when the window is too close to expiry. |
 | `ARB_MIN_EDGE_PERSIST_SCANS` | `2` | Edge must persist for N scans before entering. |
 | `ARB_MAX_POLY_OVERROUND` | `0.04` | Reject entries when Polymarket implied total is too distorted. |
 | `ARB_MIN_KALSHI_LEVEL_QTY` | `10` | Require minimum size at the Kalshi level used for entry. |
@@ -183,6 +184,8 @@ All settings in `.env`:
 | `ARB_ORDER_REPRICE_ATTEMPTS` | `0` | Reserved for repricing policy. |
 | `ARB_ORDER_TIMEOUT_SECONDS` | `4` | Reserved for cancel/timeout policy. |
 | `ARB_ALLOW_PARTIAL_FILLS` | `false` | If false, partials are flagged for manual handling. |
+| `ARB_EXIT_REPRICE_ATTEMPTS` | `2` | Number of exit repricing attempts before final aggressive flatten. |
+| `ARB_EXIT_FILL_TIMEOUT_SECONDS` | `2` | Seconds to wait for each exit attempt to fill before cancel/reprice. |
 | `ARB_ENTRY_MARKETABLE` | `true` | Use marketable-limit behavior on entry for fast fills. |
 | `ARB_POLY_ENTRY_AGGRESSION` | `0.01` | Extra price added to Poly entry limits. |
 | `ARB_KALSHI_ENTRY_AGGRESSION_CENTS` | `1` | Extra cents added to Kalshi entry limits. |
@@ -280,7 +283,7 @@ These thresholds are configurable. The target/stop percentages are set in the `P
 
 | Risk | Description | Mitigation |
 |---|---|---|
-| **Execution** | One leg fills, the other fails | System warns on partial fills; manual review needed |
+| **Execution** | One leg fills, the other fails | Emergency stop plus best-effort flatten of the exposed leg when partial fills are disabled |
 | **Liquidity** | Thin books cause slippage | Position sizing is conservative; scan checks book depth |
 | **Timing** | Prices move between placing both orders | Orders placed near-simultaneously; limit orders prevent overpay |
 | **Overround / underround** | Venue totals may not sum to `1.00`, especially on Polymarket | Log both sides directly; do not force synthetic complementarity on research data |

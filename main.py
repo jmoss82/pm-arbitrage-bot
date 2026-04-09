@@ -73,6 +73,10 @@ def _seconds_into_15m_window(now_ts: float | None = None) -> int:
     return (dt.minute % 15) * 60 + dt.second
 
 
+def _seconds_until_15m_window_end(now_ts: float | None = None) -> int:
+    return max(0, 900 - _seconds_into_15m_window(now_ts))
+
+
 def _entry_timing_allowed(pair_label: str) -> tuple[bool, str]:
     if not config.ARB_BTC15_TIME_GATING:
         return True, "timing-gate-disabled"
@@ -415,10 +419,20 @@ async def cmd_monitor(args):
                         logger.warning("Failed to update position %s: %s", pos.id, e)
 
                 exit_signals = pos_mgr.check_exit_signals()
+                if config.ARB_BTC15_ONLY:
+                    seconds_remaining = _seconds_until_15m_window_end()
+                    if seconds_remaining <= config.ARB_FORCE_EXIT_SECONDS_REMAINING:
+                        for pos in pos_mgr.positions.values():
+                            if pos.status != "open":
+                                continue
+                            if not any(existing.id == pos.id for existing, _ in exit_signals):
+                                exit_signals.append((pos, "time_stop"))
                 for pos, reason in exit_signals:
                     print(f"  [{ts}] EXIT SIGNAL [{reason}]: {pos.pair_label}")
                     print(f"    Spread: {pos.entry_spread:.4f} -> {pos.current_spread:.4f} "
                           f"({pos.spread_compression_pct*100:.0f}% compression)")
+                    if reason == "time_stop":
+                        print(f"    Window protection: {config.ARB_FORCE_EXIT_SECONDS_REMAINING}s remaining threshold reached")
                     if executor:
                         result = executor.exit(pos, reason)
                         print(f"    > {result.summary()}")

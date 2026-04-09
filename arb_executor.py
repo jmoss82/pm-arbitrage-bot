@@ -355,47 +355,24 @@ class ArbExecutor:
         # Sell both legs
         poly_token, kalshi_side = self._exit_params(pos)
 
-        # Sell on Polymarket (limit-first on exit)
+        # Sell on Polymarket with escalation if passive exits do not fill.
         try:
-            bid, ask = self.poly.get_best_prices(poly_token)
-            sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
-            poly_result = self._place_poly_with_reprice(
-                side="sell",
-                token_id=poly_token,
-                start_price=sell_price,
-                size=float(pos.contracts),
-            )
-            if isinstance(poly_result, dict) and poly_result.get("success") is False:
-                result.poly_error = poly_result.get("errorMsg") or str(poly_result)
-                result.poly_status = str(poly_result.get("status", "failed"))
-            else:
-                result.poly_success = True
-                if isinstance(poly_result, dict):
-                    result.poly_order_id = (
-                        poly_result.get("orderID")
-                        or poly_result.get("id")
-                        or (poly_result.get("order") or {}).get("id")
-                    )
-                    result.poly_status = str(poly_result.get("status", "posted"))
+            poly_success, poly_meta = self._exit_poly_with_escalation(poly_token, pos.contracts)
+            result.poly_success = poly_success
+            result.poly_order_id = poly_meta.get("order_id")
+            result.poly_status = poly_meta.get("status")
+            result.poly_error = poly_meta.get("error")
         except Exception as e:
             result.poly_error = str(e)
             logger.error("Poly exit failed: %s", e)
 
-        # Sell on Kalshi (limit-first on exit)
+        # Sell on Kalshi with escalation if passive exits do not fill.
         try:
-            yes_price, no_price = self._exit_kalshi_limit_prices(pos.kalshi_ticker, kalshi_side)
-            order = self.kalshi.create_order(
-                ticker=pos.kalshi_ticker,
-                side=kalshi_side,
-                action="sell",
-                count=pos.contracts,
-                yes_price=yes_price,
-                no_price=no_price,
-                client_order_id=f"arb-x-{uuid.uuid4().hex[:8]}",
-            )
-            result.kalshi_success = True
-            result.kalshi_order_id = order.order_id
-            result.kalshi_status = order.status
+            kalshi_success, kalshi_meta = self._exit_kalshi_with_escalation(pos.kalshi_ticker, kalshi_side, pos.contracts)
+            result.kalshi_success = kalshi_success
+            result.kalshi_order_id = kalshi_meta.get("order_id")
+            result.kalshi_status = kalshi_meta.get("status")
+            result.kalshi_error = kalshi_meta.get("error")
         except Exception as e:
             result.kalshi_error = str(e)
             logger.error("Kalshi exit failed: %s", e)
@@ -494,6 +471,136 @@ class ArbExecutor:
         except Exception:
             pass
         return yes_price, no_price
+
+    def _exit_poly_with_escalation(self, token_id: str, contracts: int) -> tuple[bool, dict]:
+        attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
+        last_meta = {"error": "poly exit not attempted", "status": "failed", "order_id": None}
+        for attempt in range(attempts + 1):
+            bid, ask = self.poly.get_best_prices(token_id)
+            if attempt == attempts:
+                base = bid if bid is not None else (ask if ask is not None else 0.01)
+                sell_price = max(0.01, min(0.99, base - 0.01))
+            else:
+                sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
+                sell_price = max(0.01, min(0.99, sell_price - (attempt * 0.005)))
+
+            poly_result = self.poly.sell(token_id, sell_price, float(contracts))
+            if isinstance(poly_result, dict) and poly_result.get("success") is False:
+                last_meta = {
+                    "error": poly_result.get("errorMsg") or str(poly_result),
+                    "status": str(poly_result.get("status", "failed")),
+                    "order_id": None,
+                }
+                continue
+
+            order_id = None
+            status = "posted"
+            if isinstance(poly_result, dict):
+                order_id = (
+                    poly_result.get("orderID")
+                    or poly_result.get("id")
+                    or (poly_result.get("order") or {}).get("id")
+                )
+                status = str(poly_result.get("status", "posted"))
+
+            if not order_id:
+                return True, {"order_id": None, "status": status, "error": None}
+
+            filled, latest_status = self._wait_for_poly_fill(order_id)
+            if filled:
+                return True, {"order_id": order_id, "status": latest_status, "error": None}
+
+            try:
+                self.poly.cancel(order_id)
+            except Exception:
+                pass
+
+            last_meta = {
+                "error": f"unfilled after attempt {attempt + 1}",
+                "status": latest_status,
+                "order_id": order_id,
+            }
+
+        return False, last_meta
+
+    def _exit_kalshi_with_escalation(self, ticker: str, side: str, contracts: int) -> tuple[bool, dict]:
+        attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
+        last_meta = {"error": "kalshi exit not attempted", "status": "failed", "order_id": None}
+        for attempt in range(attempts + 1):
+            yes_price, no_price = self._exit_kalshi_limit_prices(ticker, side)
+            if attempt == attempts:
+                # Final attempt crosses toward the bid to get flat.
+                ob = self.kalshi.get_orderbook(ticker)
+                prices = _kalshi_book_to_prices(ob)
+                if side == "yes":
+                    bid_ref = prices.get("yes_bid")
+                    px = int(round((bid_ref or 0.01) * 100))
+                    yes_price, no_price = max(1, min(99, px)), None
+                else:
+                    bid_ref = prices.get("no_bid")
+                    px = int(round((bid_ref or 0.01) * 100))
+                    yes_price, no_price = None, max(1, min(99, px))
+            order = self.kalshi.create_order(
+                ticker=ticker,
+                side=side,
+                action="sell",
+                count=contracts,
+                yes_price=yes_price,
+                no_price=no_price,
+                client_order_id=f"arb-x-{uuid.uuid4().hex[:8]}",
+            )
+            if self._kalshi_order_is_filled(order.status):
+                return True, {"order_id": order.order_id, "status": order.status, "error": None}
+
+            filled, latest_status = self._wait_for_kalshi_fill(order.order_id)
+            if filled:
+                return True, {"order_id": order.order_id, "status": latest_status, "error": None}
+
+            try:
+                self.kalshi.cancel_order(order.order_id)
+            except Exception:
+                pass
+
+            last_meta = {
+                "error": f"unfilled after attempt {attempt + 1}",
+                "status": latest_status,
+                "order_id": order.order_id,
+            }
+
+        return False, last_meta
+
+    def _wait_for_poly_fill(self, order_id: str) -> tuple[bool, str]:
+        deadline = time.time() + max(1, config.ARB_EXIT_FILL_TIMEOUT_SECONDS)
+        last_status = "posted"
+        while time.time() < deadline:
+            try:
+                order = self.poly.get_order(order_id)
+                last_status = str((order or {}).get("status", last_status)).lower()
+                if last_status in {"filled", "matched", "executed"}:
+                    return True, last_status
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return False, last_status
+
+    def _wait_for_kalshi_fill(self, order_id: str) -> tuple[bool, str]:
+        deadline = time.time() + max(1, config.ARB_EXIT_FILL_TIMEOUT_SECONDS)
+        last_status = "posted"
+        while time.time() < deadline:
+            try:
+                order = self.kalshi.get_order(order_id)
+                if order:
+                    last_status = order.status
+                    if self._kalshi_order_is_filled(last_status):
+                        return True, last_status
+            except Exception:
+                pass
+            time.sleep(0.4)
+        return False, last_status
+
+    def _kalshi_order_is_filled(self, status: str | None) -> bool:
+        text = (status or "").lower()
+        return text in {"filled", "executed", "completed"}
 
     def _log_trade_result(self, action: str, result: TradeResult, context: dict):
         try:
