@@ -23,6 +23,14 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
 
+def _mask_value(value: str | None, prefix: int = 6, suffix: int = 4) -> str:
+    if not value:
+        return "(missing)"
+    if len(value) <= prefix + suffix:
+        return value
+    return f"{value[:prefix]}...{value[-suffix:]}"
+
+
 @dataclass
 class PolymarketMarket:
     condition_id: str = ""
@@ -73,7 +81,22 @@ class PolymarketClient:
         self.clob = self._init_clob(derive_keys)
 
     def _init_clob(self, derive_keys: bool) -> ClobClient:
-        if derive_keys and config.POLY_PRIVATE_KEY:
+        explicit_creds_available = all(
+            [
+                config.POLY_API_KEY,
+                config.POLY_API_SECRET,
+                config.POLY_API_PASSPHRASE,
+            ]
+        )
+
+        if explicit_creds_available:
+            logger.info("Using configured Polymarket API credentials.")
+            creds = ApiCreds(
+                api_key=config.POLY_API_KEY,
+                api_secret=config.POLY_API_SECRET,
+                api_passphrase=config.POLY_API_PASSPHRASE,
+            )
+        elif derive_keys and config.POLY_PRIVATE_KEY:
             logger.info("Deriving Polymarket API credentials (IP-bound)...")
             l1_client = ClobClient(
                 host=config.CLOB_HOST,
@@ -95,6 +118,7 @@ class PolymarketClient:
             logger.info("Polymarket API key derived: %s...", api_key[:16])
             creds = ApiCreds(api_key, api_secret, api_passphrase)
         else:
+            logger.info("Using configured Polymarket API credentials.")
             creds = ApiCreds(
                 api_key=config.POLY_API_KEY,
                 api_secret=config.POLY_API_SECRET,
@@ -261,16 +285,31 @@ class PolymarketClient:
 
     # ── Balance / Positions ──────────────────────────────────────────────
 
-    def get_usdc_balance(self) -> float | None:
-        """Return USDC balance in human units."""
+    def get_usdc_balance_details(self) -> tuple[float | None, dict]:
+        """Return parsed USDC balance plus safe diagnostics about the query."""
+        details = {
+            "funder": _mask_value(config.POLY_FUNDER),
+            "host": config.CLOB_HOST,
+            "raw_type": None,
+            "raw_keys": [],
+        }
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             bal = self.clob.get_balance_allowance(params)
+            details["raw_type"] = type(bal).__name__
             if isinstance(bal, dict):
-                return float(bal.get("balance", "0")) / 1e6
+                details["raw_keys"] = sorted(str(k) for k in bal.keys())
+                return float(bal.get("balance", "0")) / 1e6, details
+            return None, details
         except Exception as e:
-            logger.warning("Failed to get USDC balance: %s", e)
-        return None
+            details["error"] = str(e)
+            logger.warning("Failed to get USDC balance for funder %s: %s", details["funder"], e)
+            return None, details
+
+    def get_usdc_balance(self) -> float | None:
+        """Return USDC balance in human units."""
+        balance, _ = self.get_usdc_balance_details()
+        return balance
 
     @staticmethod
     async def fetch_positions(session: aiohttp.ClientSession, wallet: str) -> list[dict]:

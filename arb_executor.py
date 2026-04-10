@@ -132,12 +132,24 @@ class ArbExecutor:
             issues.append(f"kalshi balance check failed: {e}")
 
         try:
-            poly_usdc = self.poly.get_usdc_balance()
+            poly_usdc, poly_details = self.poly.get_usdc_balance_details()
+            logger.info(
+                "Polymarket preflight: funder=%s host=%s raw_type=%s raw_keys=%s balance=%s",
+                poly_details.get("funder"),
+                poly_details.get("host"),
+                poly_details.get("raw_type"),
+                poly_details.get("raw_keys"),
+                "unavailable" if poly_usdc is None else f"${poly_usdc:.2f}",
+            )
             if poly_usdc is None:
-                issues.append("polymarket balance unavailable")
+                extra = f" (funder {poly_details.get('funder')})"
+                if poly_details.get("error"):
+                    extra = f"{extra}: {poly_details.get('error')}"
+                issues.append(f"polymarket balance unavailable{extra}")
             elif poly_usdc < config.ARB_MIN_POLY_BALANCE_USD:
                 issues.append(
-                    f"polymarket balance ${poly_usdc:.2f} < ${config.ARB_MIN_POLY_BALANCE_USD:.2f}"
+                    f"polymarket balance ${poly_usdc:.2f} < ${config.ARB_MIN_POLY_BALANCE_USD:.2f} "
+                    f"(funder {poly_details.get('funder')})"
                 )
         except Exception as e:
             issues.append(f"polymarket balance check failed: {e}")
