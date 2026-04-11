@@ -89,12 +89,13 @@ ARB_ENTRY_MARKETABLE = os.getenv("ARB_ENTRY_MARKETABLE", "true").lower() in (
 )
 ARB_POLY_ENTRY_AGGRESSION = float(os.getenv("ARB_POLY_ENTRY_AGGRESSION", "0.01"))
 ARB_KALSHI_ENTRY_AGGRESSION_CENTS = int(os.getenv("ARB_KALSHI_ENTRY_AGGRESSION_CENTS", "1"))
-ARB_EXIT_LIMIT_ONLY = os.getenv("ARB_EXIT_LIMIT_ONLY", "true").lower() in (
+ARB_EXIT_LIMIT_ONLY = os.getenv("ARB_EXIT_LIMIT_ONLY", "false").lower() in (
     "true", "1", "yes"
 )
 ARB_POLY_EXIT_PASSIVE_OFFSET = float(os.getenv("ARB_POLY_EXIT_PASSIVE_OFFSET", "0.01"))
 ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS = int(os.getenv("ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS", "1"))
 ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE = float(os.getenv("ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE", "0.01"))
+ARB_POLY_SELL_SIZE_FACTOR = float(os.getenv("ARB_POLY_SELL_SIZE_FACTOR", "0.98"))
 
 # ── Logging ─────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

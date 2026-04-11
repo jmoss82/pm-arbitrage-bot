@@ -23,6 +23,21 @@ from trade_logger import log_execution
 
 logger = logging.getLogger(__name__)
 
+# Polymarket's CLOB has a known server-side balance cache bug where
+# instantly-matched buys leave the cache stale, causing 100% sells to
+# fail with "not enough balance / allowance".  Selling a slightly
+# reduced share count (e.g. 98%) reliably passes validation.  The
+# residual dust settles automatically at market resolution.
+# See: https://github.com/Polymarket/py-clob-client/issues/287
+_POLY_SELL_SIZE_FACTOR = config.ARB_POLY_SELL_SIZE_FACTOR
+
+
+def _poly_sell_size(contracts: int) -> float:
+    """Return a Polymarket-safe sell size: reduced by the sell factor and
+    truncated to 3 decimal places (floor) to avoid floating-point dust."""
+    raw = contracts * _POLY_SELL_SIZE_FACTOR
+    return math.floor(raw * 1000) / 1000
+
 
 @dataclass
 class TradeResult:
@@ -338,6 +353,16 @@ class ArbExecutor:
 
     def exit(self, pos: ArbPosition, reason: str = "manual") -> TradeResult:
         """Close an open spread position by selling both legs."""
+        if pos.status == "stuck_exit":
+            return TradeResult(
+                action="exit",
+                timestamp=time.time(),
+                dry_run=self.dry_run,
+                contracts=pos.contracts,
+                poly_error="position stuck — manual intervention required",
+                kalshi_error="position stuck — manual intervention required",
+            )
+
         result = TradeResult(
             action="exit", timestamp=time.time(), dry_run=self.dry_run,
             contracts=pos.contracts,
@@ -458,11 +483,13 @@ class ArbExecutor:
         return max(1, min(99, int(round(ask_ref * 100)) + self.kalshi_entry_aggr_c))
 
     def _exit_poly_limit_price(self, bid: float | None, ask: float | None) -> float:
-        # Limit out: target above current bid when possible.
-        base = bid if bid is not None else (ask if ask is not None else 0.01)
         if self.exit_limit_only:
+            base = bid if bid is not None else (ask if ask is not None else 0.01)
             return max(0.01, min(0.99, base + self.poly_exit_passive))
-        return max(0.01, min(0.99, base - self.poly_limit_offset))
+        # Aggressive: price off the bid and subtract aggression to cross the
+        # spread, mirroring how entries price off the ask.
+        base = bid if bid is not None else (ask if ask is not None else 0.01)
+        return max(0.01, min(0.99, base - self.poly_entry_aggr))
 
     def _exit_kalshi_limit_prices(self, ticker: str, kalshi_side: str) -> tuple[int | None, int | None]:
         yes_price = None
@@ -470,16 +497,20 @@ class ArbExecutor:
         try:
             ob = self.kalshi.get_orderbook(ticker)
             prices = _kalshi_book_to_prices(ob)
+            if self.exit_limit_only:
+                offset = self.kalshi_exit_passive_c
+            else:
+                offset = -self.kalshi_entry_aggr_c
             if kalshi_side == "yes":
                 bid_ref = prices.get("yes_bid")
                 if bid_ref is not None:
                     px = int(round(bid_ref * 100))
-                    yes_price = max(1, min(99, px + self.kalshi_exit_passive_c))
+                    yes_price = max(1, min(99, px + offset))
             else:
                 bid_ref = prices.get("no_bid")
                 if bid_ref is not None:
                     px = int(round(bid_ref * 100))
-                    no_price = max(1, min(99, px + self.kalshi_exit_passive_c))
+                    no_price = max(1, min(99, px + offset))
         except Exception:
             pass
         return yes_price, no_price
@@ -487,16 +518,24 @@ class ArbExecutor:
     def _exit_poly_with_escalation(self, token_id: str, contracts: int) -> tuple[bool, dict]:
         attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
         last_meta = {"error": "poly exit not attempted", "status": "failed", "order_id": None}
+        sell_size = _poly_sell_size(contracts)
+        if sell_size <= 0:
+            return False, {"error": "sell size rounded to zero", "status": "failed", "order_id": None}
+
+        self.poly.refresh_conditional_allowance(token_id)
+
         for attempt in range(attempts + 1):
             bid, ask = self.poly.get_best_prices(token_id)
             if attempt == attempts:
-                base = bid if bid is not None else (ask if ask is not None else 0.01)
-                sell_price = max(0.01, min(0.99, base - 0.01))
+                # Final attempt: dump at $0.01 — guaranteed fill if any
+                # buyer exists.  On these short-lived markets getting flat
+                # matters more than the last few cents.
+                sell_price = 0.01
             else:
                 sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
-                sell_price = max(0.01, min(0.99, sell_price - (attempt * 0.005)))
+                sell_price = max(0.01, min(0.99, sell_price - (attempt * 0.01)))
 
-            poly_result = self.poly.sell(token_id, sell_price, float(contracts))
+            poly_result = self.poly.sell(token_id, sell_price, sell_size)
             if isinstance(poly_result, dict) and poly_result.get("success") is False:
                 last_meta = {
                     "error": poly_result.get("errorMsg") or str(poly_result),
@@ -541,17 +580,13 @@ class ArbExecutor:
         for attempt in range(attempts + 1):
             yes_price, no_price = self._exit_kalshi_limit_prices(ticker, side)
             if attempt == attempts:
-                # Final attempt crosses toward the bid to get flat.
-                ob = self.kalshi.get_orderbook(ticker)
-                prices = _kalshi_book_to_prices(ob)
+                # Final attempt: sell at 1c — guaranteed fill if any buyer
+                # exists.  Getting flat matters more than price on expiring
+                # contracts.
                 if side == "yes":
-                    bid_ref = prices.get("yes_bid")
-                    px = int(round((bid_ref or 0.01) * 100))
-                    yes_price, no_price = max(1, min(99, px)), None
+                    yes_price, no_price = 1, None
                 else:
-                    bid_ref = prices.get("no_bid")
-                    px = int(round((bid_ref or 0.01) * 100))
-                    yes_price, no_price = None, max(1, min(99, px))
+                    yes_price, no_price = None, 1
             order = self.kalshi.create_order(
                 ticker=ticker,
                 side=side,
@@ -697,33 +732,31 @@ class ArbExecutor:
             self._emergency_flatten_kalshi(pos.kalshi_ticker, kalshi_side, pos.contracts)
         elif result.kalshi_success and not result.poly_success:
             self._emergency_flatten_poly(poly_token, pos.contracts)
+        pos.status = "stuck_exit"
         self._trip_emergency_stop(f"partial exit on {pos.pair_label}")
 
     def _emergency_flatten_poly(self, token_id: str, contracts: int):
+        sell_size = _poly_sell_size(contracts)
+        if sell_size <= 0:
+            logger.error("Emergency Poly flatten: sell size rounded to zero")
+            print("      Emergency Poly flatten: sell size rounded to zero")
+            return
         try:
-            bid, ask = self.poly.get_best_prices(token_id)
-            ref = bid if bid is not None else (ask if ask is not None else 0.01)
-            price = max(0.01, min(0.99, ref - 0.01))
-            self.poly.sell(token_id, price, float(contracts))
-            logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=%.4f", token_id, contracts, price)
-            print(f"      Emergency Poly flatten submitted @ {price:.4f}")
+            self.poly.refresh_conditional_allowance(token_id)
+            self.poly.sell(token_id, 0.01, sell_size)
+            logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=0.01", token_id, sell_size)
+            print(f"      Emergency Poly flatten submitted @ $0.01 ({sell_size} shares)")
         except Exception as e:
             logger.error("Emergency Poly flatten failed: %s", e)
             print(f"      Emergency Poly flatten failed: {e}")
 
     def _emergency_flatten_kalshi(self, ticker: str, side: str, contracts: int):
         try:
-            ob = self.kalshi.get_orderbook(ticker)
-            prices = _kalshi_book_to_prices(ob)
             yes_price = no_price = None
             if side == "yes":
-                bid_ref = prices.get("yes_bid")
-                px = int(round((bid_ref or 0.01) * 100))
-                yes_price = max(1, min(99, px))
+                yes_price = 1
             else:
-                bid_ref = prices.get("no_bid")
-                px = int(round((bid_ref or 0.01) * 100))
-                no_price = max(1, min(99, px))
+                no_price = 1
             self.kalshi.create_order(
                 ticker=ticker,
                 side=side,
@@ -733,8 +766,8 @@ class ArbExecutor:
                 no_price=no_price,
                 client_order_id=f"arb-emerg-{uuid.uuid4().hex[:8]}",
             )
-            logger.warning("Emergency Kalshi flatten submitted: ticker=%s side=%s count=%s", ticker, side, contracts)
-            print(f"      Emergency Kalshi flatten submitted on {ticker} ({side})")
+            logger.warning("Emergency Kalshi flatten submitted: ticker=%s side=%s count=%s price=1c", ticker, side, contracts)
+            print(f"      Emergency Kalshi flatten submitted on {ticker} ({side}) @ 1c")
         except Exception as e:
             logger.error("Emergency Kalshi flatten failed: %s", e)
             print(f"      Emergency Kalshi flatten failed: {e}")

@@ -13,6 +13,7 @@ from py_clob_client.clob_types import (
     OrderArgs,
     BalanceAllowanceParams,
     AssetType,
+    OrderType,
 )
 
 import config
@@ -276,6 +277,23 @@ class PolymarketClient:
         return self.clob.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side="SELL")
         )
+
+    def refresh_conditional_allowance(self, token_id: str):
+        """Nudge the CLOB's cached conditional-token allowance for this token.
+
+        Polymarket's CLOB has a known server-side balance cache bug where
+        instantly-matched buys don't update the cache fast enough, causing
+        subsequent sells at full size to fail with 'not enough balance /
+        allowance'.  Calling update_balance_allowance(CONDITIONAL) before a
+        sell forces a cache refresh and significantly improves reliability.
+        See: https://github.com/Polymarket/py-clob-client/issues/287
+        """
+        try:
+            self.clob.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            )
+        except Exception as e:
+            logger.debug("update_balance_allowance(CONDITIONAL) for %s: %s", token_id[:12], e)
 
     def cancel(self, order_id: str):
         return self.clob.cancel(order_id)
