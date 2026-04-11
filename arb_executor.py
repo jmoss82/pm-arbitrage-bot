@@ -518,59 +518,80 @@ class ArbExecutor:
     def _exit_poly_with_escalation(self, token_id: str, contracts: int) -> tuple[bool, dict]:
         attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
         last_meta = {"error": "poly exit not attempted", "status": "failed", "order_id": None}
-        sell_size = _poly_sell_size(contracts)
-        if sell_size <= 0:
-            return False, {"error": "sell size rounded to zero", "status": "failed", "order_id": None}
 
         self.poly.refresh_conditional_allowance(token_id)
 
-        for attempt in range(attempts + 1):
-            bid, ask = self.poly.get_best_prices(token_id)
-            if attempt == attempts:
-                # Final attempt: dump at $0.01 — guaranteed fill if any
-                # buyer exists.  On these short-lived markets getting flat
-                # matters more than the last few cents.
-                sell_price = 0.01
-            else:
-                sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
-                sell_price = max(0.01, min(0.99, sell_price - (attempt * 0.01)))
+        # Try progressively smaller sizes.  Taker fees on entry mean we
+        # received fewer shares than the nominal count, and the CLOB's
+        # balance cache can be stale on top of that.
+        size_factors = [_POLY_SELL_SIZE_FACTOR, 0.93, 0.90, 0.85]
 
-            poly_result = self.poly.sell(token_id, sell_price, sell_size)
-            if isinstance(poly_result, dict) and poly_result.get("success") is False:
-                last_meta = {
-                    "error": poly_result.get("errorMsg") or str(poly_result),
-                    "status": str(poly_result.get("status", "failed")),
-                    "order_id": None,
-                }
+        for size_factor in size_factors:
+            sell_size = math.floor(contracts * size_factor * 1000) / 1000
+            if sell_size <= 0:
                 continue
 
-            order_id = None
-            status = "posted"
-            if isinstance(poly_result, dict):
-                order_id = (
-                    poly_result.get("orderID")
-                    or poly_result.get("id")
-                    or (poly_result.get("order") or {}).get("id")
-                )
-                status = str(poly_result.get("status", "posted"))
+            for attempt in range(attempts + 1):
+                bid, ask = self.poly.get_best_prices(token_id)
+                if attempt == attempts:
+                    sell_price = 0.01
+                else:
+                    sell_price = self._exit_poly_limit_price(bid=bid, ask=ask)
+                    sell_price = max(0.01, min(0.99, sell_price - (attempt * 0.01)))
 
-            if not order_id:
-                return True, {"order_id": None, "status": status, "error": None}
+                try:
+                    poly_result = self.poly.sell(token_id, sell_price, sell_size)
+                except Exception as e:
+                    err_str = str(e)
+                    if "not enough balance" in err_str:
+                        logger.warning("Poly sell at %.0f%% (%s shares) balance error, reducing size", size_factor * 100, sell_size)
+                        last_meta = {"error": err_str, "status": "failed", "order_id": None}
+                        break  # try next smaller size
+                    raise
 
-            filled, latest_status = self._wait_for_poly_fill(order_id)
-            if filled:
-                return True, {"order_id": order_id, "status": latest_status, "error": None}
+                if isinstance(poly_result, dict) and poly_result.get("success") is False:
+                    err_msg = poly_result.get("errorMsg") or str(poly_result)
+                    if "not enough balance" in err_msg:
+                        logger.warning("Poly sell at %.0f%% (%s shares) balance error, reducing size", size_factor * 100, sell_size)
+                        last_meta = {"error": err_msg, "status": "failed", "order_id": None}
+                        break  # try next smaller size
+                    last_meta = {
+                        "error": err_msg,
+                        "status": str(poly_result.get("status", "failed")),
+                        "order_id": None,
+                    }
+                    continue
 
-            try:
-                self.poly.cancel(order_id)
-            except Exception:
-                pass
+                order_id = None
+                status = "posted"
+                if isinstance(poly_result, dict):
+                    order_id = (
+                        poly_result.get("orderID")
+                        or poly_result.get("id")
+                        or (poly_result.get("order") or {}).get("id")
+                    )
+                    status = str(poly_result.get("status", "posted"))
 
-            last_meta = {
-                "error": f"unfilled after attempt {attempt + 1}",
-                "status": latest_status,
-                "order_id": order_id,
-            }
+                if not order_id:
+                    return True, {"order_id": None, "status": status, "error": None}
+
+                filled, latest_status = self._wait_for_poly_fill(order_id)
+                if filled:
+                    return True, {"order_id": order_id, "status": latest_status, "error": None}
+
+                try:
+                    self.poly.cancel(order_id)
+                except Exception:
+                    pass
+
+                last_meta = {
+                    "error": f"unfilled after attempt {attempt + 1}",
+                    "status": latest_status,
+                    "order_id": order_id,
+                }
+            else:
+                continue  # inner loop finished without break — no balance error
+            continue  # broke out of inner loop — try next size factor
 
         return False, last_meta
 
@@ -736,19 +757,23 @@ class ArbExecutor:
         self._trip_emergency_stop(f"partial exit on {pos.pair_label}")
 
     def _emergency_flatten_poly(self, token_id: str, contracts: int):
-        sell_size = _poly_sell_size(contracts)
-        if sell_size <= 0:
-            logger.error("Emergency Poly flatten: sell size rounded to zero")
-            print("      Emergency Poly flatten: sell size rounded to zero")
-            return
-        try:
-            self.poly.refresh_conditional_allowance(token_id)
-            self.poly.sell(token_id, 0.01, sell_size)
-            logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=0.01", token_id, sell_size)
-            print(f"      Emergency Poly flatten submitted @ $0.01 ({sell_size} shares)")
-        except Exception as e:
-            logger.error("Emergency Poly flatten failed: %s", e)
-            print(f"      Emergency Poly flatten failed: {e}")
+        self.poly.refresh_conditional_allowance(token_id)
+        # Try progressively smaller sizes.  The CLOB's cached balance can
+        # be significantly stale after instant-match buys, and taker fees
+        # mean we received fewer shares than the nominal contract count.
+        for factor in (0.95, 0.90, 0.85, 0.80):
+            sell_size = math.floor(contracts * factor * 1000) / 1000
+            if sell_size <= 0:
+                continue
+            try:
+                self.poly.sell(token_id, 0.01, sell_size)
+                logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=0.01", token_id, sell_size)
+                print(f"      Emergency Poly flatten submitted @ $0.01 ({sell_size} shares)")
+                return
+            except Exception as e:
+                logger.warning("Emergency Poly flatten at %.0f%% (%s shares) failed: %s", factor * 100, sell_size, e)
+        logger.error("Emergency Poly flatten exhausted all size attempts")
+        print("      Emergency Poly flatten failed: exhausted all size attempts")
 
     def _emergency_flatten_kalshi(self, ticker: str, side: str, contracts: int):
         try:
