@@ -247,11 +247,17 @@ class PolymarketClient:
             best_ask = None
 
             if bids:
-                bp = float(bids[0].price if hasattr(bids[0], "price") else bids[0]["price"])
-                best_bid = bp
+                bid_prices = [
+                    float(level.price if hasattr(level, "price") else level["price"])
+                    for level in bids
+                ]
+                best_bid = max(bid_prices) if bid_prices else None
             if asks:
-                ap = float(asks[0].price if hasattr(asks[0], "price") else asks[0]["price"])
-                best_ask = ap
+                ask_prices = [
+                    float(level.price if hasattr(level, "price") else level["price"])
+                    for level in asks
+                ]
+                best_ask = min(ask_prices) if ask_prices else None
 
             # If the standing book spread is > 20%, the book is sparse.
             # Use midpoint as the effective price instead.

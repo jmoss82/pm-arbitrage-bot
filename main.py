@@ -121,7 +121,9 @@ def _btc_diag_line(snap, opp) -> str:
     mid_spread = snap.mid_spread
     parts = [
         f"K y {_fmt_px(snap.kalshi_yes_bid)}/{_fmt_px(snap.kalshi_yes_ask)}",
+        f"K n {_fmt_px(snap.kalshi_no_bid)}/{_fmt_px(snap.kalshi_no_ask)}",
         f"P y {_fmt_px(snap.poly_yes_bid)}/{_fmt_px(snap.poly_yes_ask)}",
+        f"P n {_fmt_px(snap.poly_no_bid)}/{_fmt_px(snap.poly_no_ask)}",
         f"mid {_fmt_px(mid_spread)}",
     ]
     if opp:
