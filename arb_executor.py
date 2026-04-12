@@ -119,6 +119,7 @@ class ArbExecutor:
         self.kalshi_exit_passive_c = config.ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS
         self.emergency_stop = False
         self.emergency_reason: str | None = None
+        self._stop_loss_cooldowns: dict[str, float] = {}
 
     def preflight_check(self) -> tuple[bool, list[str]]:
         """
@@ -228,6 +229,20 @@ class ArbExecutor:
                 dry_run=self.dry_run,
                 poly_error=f"max open positions reached ({config.ARB_MAX_OPEN_POSITIONS})",
                 kalshi_error=f"max open positions reached ({config.ARB_MAX_OPEN_POSITIONS})",
+            )
+
+        cooldown_key = f"{opp.pair.kalshi_ticker}:{opp.direction.value}"
+        cooldown_until = self._stop_loss_cooldowns.get(cooldown_key, 0)
+        remaining = cooldown_until - time.time()
+        if remaining > 0:
+            msg = f"stop-loss cooldown ({remaining:.0f}s remaining)"
+            logger.info("ENTER blocked: %s — %s", opp.pair.label, msg)
+            return TradeResult(
+                action="entry",
+                timestamp=time.time(),
+                dry_run=self.dry_run,
+                poly_error=msg,
+                kalshi_error=msg,
             )
 
         contracts = self._compute_entry_size(opp)
@@ -416,6 +431,11 @@ class ArbExecutor:
 
         if result.both_filled:
             self.positions.close_position(pos.id, pos.unrealized_pnl, reason=reason)
+            if reason == "stop_loss":
+                cooldown_key = f"{pos.kalshi_ticker}:{pos.direction}"
+                cooldown_sec = config.ARB_STOP_LOSS_COOLDOWN_SECONDS
+                self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
+                logger.info("Stop-loss cooldown: %s blocked for %ds", cooldown_key, cooldown_sec)
         elif result.one_leg_only:
             self._warn_partial("EXIT", label, result)
             if not self.allow_partials:
