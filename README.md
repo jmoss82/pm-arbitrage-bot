@@ -1,6 +1,6 @@
 # Prediction Market Arbitrage
 
-Cross-platform spread trading engine for **Polymarket** and **Kalshi**. Monitors equivalent markets on both platforms, detects pricing divergences, and is being tuned around short-duration convergence opportunities rather than hold-to-resolution betting.
+Cross-platform spread trading engine for **Polymarket** and **Kalshi**. Monitors equivalent markets on both platforms, detects pricing divergences, and trades short-duration convergence opportunities rather than hold-to-resolution betting.
 
 ## Repository
 
@@ -21,17 +21,17 @@ This is **not** a hold-to-resolution strategy. We never wait for the market to s
 
 ## Current Focus
 
-The repo is still a general cross-platform arbitrage engine, but the current research focus is **BTC 15-minute markets**.
+The repo is a general cross-platform arbitrage engine, but the current live trading focus is **BTC 15-minute markets**.
 
-Why BTC 15-minute windows are the main testbed right now:
+Why BTC 15-minute windows are the primary venue:
 
 - They repeat every 15 minutes, so one session produces a lot of observations
-- They appear to show more frequent cross-platform dislocations than the earlier generic event scans
+- They show frequent cross-platform dislocations
 - They offer shorter holding periods and faster feedback than long-dated political or sports markets
 
 The dedicated monitor for this work is `btc15m_monitor.py`, which auto-discovers the active 15-minute window on both venues, rotates on expiry, and logs CSV data for later analysis.
 
-Runtime execution is now **BTC-only by default** (`ARB_BTC15_ONLY=true`), so `scan`, `monitor`, and `execute` focus on one active BTC 15-minute window pair instead of broad multi-market matching.
+Runtime execution is **BTC-only by default** (`ARB_BTC15_ONLY=true`), so `scan`, `monitor`, and `execute` focus on one active BTC 15-minute window pair instead of broad multi-market matching.
 
 Important: on Polymarket, the two outcome prices do **not** reliably sum to `1.00`. They are often overround and occasionally briefly underround. Because of that, midpoint divergence is only a research signal; executable edge is what matters for entry decisions.
 
@@ -48,7 +48,7 @@ Important: on Polymarket, the two outcome prices do **not** reliably sum to `1.0
 
 ## Current Status
 
-**Phase: Core engine rebuilt around convergence model, with BTC 15-minute monitoring as the primary live research track.**
+**Phase: Live trading on Railway with BTC 15-minute markets.**
 
 What's built:
 
@@ -56,24 +56,23 @@ What's built:
 - [x] **Polymarket client** - CLOB order execution + Gamma API market discovery, runtime key derivation
 - [x] **Cross-platform market matcher** - Event-level fuzzy matching with entity extraction
 - [x] **Spread scanner** - Detects cross-platform price divergences, estimates round-trip fees for entry + exit
-- [x] **Position manager** - Tracks open arb positions, monitors spread compression, generates exit signals (target hit or stop-loss)
-- [x] **Arb executor** - Handles both entry (open spread) and exit (close spread) on both platforms simultaneously
+- [x] **Position manager** - Tracks open arb positions, monitors spread compression, generates exit signals (target hit, stop-loss, or time stop)
+- [x] **Arb executor** - Handles entry and exit on both platforms with marketable-limit orders, escalating exit logic, and emergency flatten
 - [x] **CLI with 7 modes** - `discover`, `match`, `scan`, `monitor`, `execute`, `positions`, `status`
-- [x] **Persistence** - Open positions saved to disk, survives restarts
+- [x] **Persistence** - Open positions saved to `data/open_positions.json` (survives restarts locally; ephemeral on Railway/Docker unless a volume is mounted)
 - [x] **BTC 15-minute monitor** - Auto-discovers active BTC windows, logs midpoint spreads, executable edge, and venue overround
 - [x] **BTC-only runtime mode** - `scan`/`monitor`/`execute` restricted to the active BTC 15-minute pair
 - [x] **Execution telemetry** - signal/execution/lifecycle logs under `data/`
-- [x] **Deployment scaffolding** - `Dockerfile`, `railway.json`, and `render.yaml`
+- [x] **Deployment** - `Dockerfile`, `railway.json`, and `render.yaml`; live on Railway (Amsterdam region)
+- [x] **Polymarket CLOB workarounds** - Conditional allowance refresh, progressive sell-size reduction, and post-exit cooldown to handle the known balance cache bug
+- [x] **Emergency safety** - Partial fill detection triggers emergency flatten + entry halt; stuck positions are flagged for manual intervention
 
 What's next:
 
-- [ ] Fund Polymarket account for live testing
-- [ ] Dry-run the full entry/exit cycle on real BTC 15-minute spreads
-- [ ] Tune entry/exit parameters against 2-second BTC polling behavior
-- [ ] Add WebSocket feeds for real-time price monitoring (optional next upgrade)
-- [ ] Add alerting (Discord/Telegram) for entry/exit signals
-- [x] **Live spread monitors** - Single-market tracking with CSV logging for post-event analysis
-- [x] **API fixes** - Kalshi `orderbook_fp` format support, Polymarket midpoint-based pricing for sparse books
+- [ ] Add persistent volume or external state store for Railway so positions survive redeploys
+- [ ] Add WebSocket feeds for real-time price monitoring (reduce polling overhead)
+- [ ] Add alerting (Discord/Telegram) for entry/exit signals and emergency stops
+- [ ] Investigate Polymarket settlement latency and dynamic cooldown based on on-chain confirmation
 
 ## Project Structure
 
@@ -103,7 +102,7 @@ Prediction Market Arbitrage/
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill in credentials from both platforms. Polymarket API keys are IP-bound and get derived at runtime from your private key.
+Copy `.env.example` to `.env` and fill in credentials from both platforms. Polymarket API keys are IP-bound and get derived at runtime from your private key — do **not** set `POLY_API_KEY`/`POLY_API_SECRET`/`POLY_API_PASSPHRASE` in hosted environments; let the bot derive them on the server.
 
 For Kalshi, make sure the key and base URL point at the same environment:
 
@@ -150,62 +149,82 @@ All settings in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `ARB_SCAN_INTERVAL` | `5` | Seconds between scans in monitor mode |
-| `ARB_BTC15_ONLY` | `true` | Restrict monitor/scan/execute to the current BTC 15-minute market pair only. |
-| `ARB_MIN_EDGE` | `0.05` | Minimum spread (5 cents) to enter -- currently a working threshold and subject to BTC monitor results |
+| `ARB_BTC15_ONLY` | `true` | Restrict monitor/scan/execute to the current BTC 15-minute market pair only |
+| `ARB_MIN_EDGE` | `0.05` | Minimum spread (5 cents) to enter |
 | `ARB_MAX_POSITION_USD` | `50.0` | Max USD per position (both legs combined) |
 | `ARB_MAX_DAILY_SPEND` | `500.0` | Daily spend cap across all entries |
-| `ARB_DRY_RUN` | `true` | Paper trading mode. Keep `true` during calibration. |
-| `ARB_ENABLE_LIVE` | `false` | Additional hard gate. Live only allowed when this is true. |
-| `ARB_REQUIRE_BALANCE_CHECK` | `true` | Enforce account balance checks before live trading. |
-| `ARB_MIN_KALSHI_BALANCE_USD` | `25.0` | Minimum Kalshi cash required for live preflight. |
-| `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket USDC required for live preflight. |
-| `ARB_MAX_OPEN_POSITIONS` | `1` | Cap concurrent open arb positions. |
+| `ARB_DRY_RUN` | `true` | Paper trading mode. Keep `true` during calibration |
+| `ARB_ENABLE_LIVE` | `false` | Additional hard gate. Live only allowed when this is true |
+| `ARB_REQUIRE_BALANCE_CHECK` | `true` | Enforce account balance checks before live trading |
+| `ARB_MIN_KALSHI_BALANCE_USD` | `25.0` | Minimum Kalshi cash required for live preflight |
+| `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket USDC required for live preflight |
+| `ARB_MAX_OPEN_POSITIONS` | `1` | Cap concurrent open arb positions |
 
 ### BTC 15-minute entry controls
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARB_BTC15_TIME_GATING` | `true` | Enable entry-time gating for BTC 15m windows. |
-| `ARB_ENTRY_MIN_SECONDS_IN_WINDOW` | `45` | Do not enter too early in a fresh 15m window. |
-| `ARB_ENTRY_MAX_SECONDS_IN_WINDOW` | `780` | Stop entering near window end (avoid stale/late trades). |
-| `ARB_ENTRY_COOLDOWN_SECONDS_AFTER_ROLLOVER` | `20` | Cooldown right after rollover before new entries. |
-| `ARB_FORCE_EXIT_SECONDS_REMAINING` | `180` | Force BTC exits when the window is too close to expiry. |
-| `ARB_MIN_EDGE_PERSIST_SCANS` | `2` | Edge must persist for N scans before entering. |
-| `ARB_MAX_POLY_OVERROUND` | `0.04` | Reject entries when Polymarket implied total is too distorted. |
-| `ARB_MIN_KALSHI_LEVEL_QTY` | `10` | Require minimum size at the Kalshi level used for entry. |
-| `ARB_MAX_SIGNAL_AGE_SECONDS` | `8` | Reject stale signals between detection and order submit. |
+| `ARB_BTC15_TIME_GATING` | `true` | Enable entry-time gating for BTC 15m windows |
+| `ARB_ENTRY_MIN_SECONDS_IN_WINDOW` | `45` | Do not enter too early in a fresh 15m window |
+| `ARB_ENTRY_MAX_SECONDS_IN_WINDOW` | `780` | Stop entering near window end (avoid stale/late trades) |
+| `ARB_ENTRY_COOLDOWN_SECONDS_AFTER_ROLLOVER` | `20` | Cooldown right after rollover before new entries |
+| `ARB_FORCE_EXIT_SECONDS_REMAINING` | `180` | Force BTC exits when the window is too close to expiry |
+| `ARB_MIN_EDGE_PERSIST_SCANS` | `2` | Edge must persist for N scans before entering |
+| `ARB_MAX_POLY_OVERROUND` | `0.04` | Reject entries when Polymarket implied total is too distorted |
+| `ARB_MIN_KALSHI_LEVEL_QTY` | `10` | Require minimum size at the Kalshi level used for entry |
+| `ARB_MAX_SIGNAL_AGE_SECONDS` | `8` | Reject stale signals between detection and order submit |
 
-### Limit execution controls
+### Execution controls
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARB_POLY_LIMIT_OFFSET` | `0.00` | Buy adds offset, sell subtracts offset from Poly limit price. |
-| `ARB_KALSHI_LIMIT_OFFSET_CENTS` | `0` | Add cents to Kalshi buy limits for fill aggressiveness. |
-| `ARB_ORDER_REPRICE_ATTEMPTS` | `0` | Reserved for repricing policy. |
-| `ARB_ORDER_TIMEOUT_SECONDS` | `4` | Reserved for cancel/timeout policy. |
-| `ARB_ALLOW_PARTIAL_FILLS` | `false` | If false, partials are flagged for manual handling. |
-| `ARB_EXIT_REPRICE_ATTEMPTS` | `2` | Number of exit repricing attempts before final aggressive flatten. |
-| `ARB_EXIT_FILL_TIMEOUT_SECONDS` | `2` | Seconds to wait for each exit attempt to fill before cancel/reprice. |
-| `ARB_ENTRY_MARKETABLE` | `true` | Use marketable-limit behavior on entry for fast fills. |
-| `ARB_POLY_ENTRY_AGGRESSION` | `0.01` | Extra price added to Poly entry limits. |
-| `ARB_KALSHI_ENTRY_AGGRESSION_CENTS` | `1` | Extra cents added to Kalshi entry limits. |
-| `ARB_EXIT_LIMIT_ONLY` | `true` | Keep exits limit-first by default. |
-| `ARB_POLY_EXIT_PASSIVE_OFFSET` | `0.01` | Passive premium above bid for Poly exit limits. |
-| `ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS` | `1` | Passive premium above bid for Kalshi exit limits. |
-| `ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE` | `0.01` | Additional fixed friction buffer added to round-trip cost estimates. |
+| `ARB_ENTRY_MARKETABLE` | `true` | Use marketable-limit orders on entry for fast fills |
+| `ARB_POLY_ENTRY_AGGRESSION` | `0.01` | Extra price added to Poly entry limits to cross the spread |
+| `ARB_KALSHI_ENTRY_AGGRESSION_CENTS` | `1` | Extra cents added to Kalshi entry limits to cross the spread |
+| `ARB_EXIT_LIMIT_ONLY` | `false` | When false, exits use marketable-limit orders (cross the spread); when true, exits rest passively on the book |
+| `ARB_POLY_LIMIT_OFFSET` | `0.00` | Buy adds offset, sell subtracts offset from Poly limit price |
+| `ARB_KALSHI_LIMIT_OFFSET_CENTS` | `0` | Add cents to Kalshi buy limits for fill aggressiveness |
+| `ARB_POLY_EXIT_PASSIVE_OFFSET` | `0.01` | Passive premium above bid for Poly exit limits (used when `EXIT_LIMIT_ONLY=true`) |
+| `ARB_KALSHI_EXIT_PASSIVE_OFFSET_CENTS` | `1` | Passive premium above bid for Kalshi exit limits (used when `EXIT_LIMIT_ONLY=true`) |
+| `ARB_EXIT_REPRICE_ATTEMPTS` | `2` | Number of exit repricing attempts before final aggressive flatten |
+| `ARB_EXIT_FILL_TIMEOUT_SECONDS` | `2` | Seconds to wait for each exit attempt to fill before cancel/reprice |
+| `ARB_ORDER_REPRICE_ATTEMPTS` | `0` | Reserved for entry repricing policy |
+| `ARB_ORDER_TIMEOUT_SECONDS` | `4` | Reserved for cancel/timeout policy |
+| `ARB_ALLOW_PARTIAL_FILLS` | `false` | If false, partials trigger emergency flatten + entry halt |
+| `ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE` | `0.01` | Additional fixed friction buffer added to round-trip cost estimates |
 
-## Current paper-trading profile
+### Polymarket CLOB workarounds
 
-Current local `.env` tuning for conservative dry-run validation:
+| Variable | Default | Description |
+|---|---|---|
+| `ARB_POLY_SELL_SIZE_FACTOR` | `0.95` | Sell this fraction of held shares to account for taker fees and the CLOB balance cache bug |
+| `ARB_EXIT_COOLDOWN_SECONDS` | `60` | Seconds to block re-entry after any exit, giving Polymarket time to settle matched orders on-chain |
 
-- `ARB_BTC15_ONLY=true`
-- `ARB_SCAN_INTERVAL=2`
-- `ARB_MIN_EDGE=0.05`
-- `ARB_MAX_POSITION_USD=5.0`
-- `ARB_MAX_DAILY_SPEND=25.0`
-- `ARB_MAX_OPEN_POSITIONS=1`
-- Entry style: marketable-limit in (`ARB_ENTRY_MARKETABLE=true`)
-- Exit style: limit-first out (`ARB_EXIT_LIMIT_ONLY=true`)
+## Exit Logic
+
+The position manager watches each open position and signals an exit in these cases:
+
+| Signal | Trigger | Action |
+|---|---|---|
+| **Target** | Spread compresses by 60% of entry width | Take profit — close both legs |
+| **Stop-loss** | Spread widens by 50% beyond entry width | Cut losses — close both legs |
+| **Time stop** | BTC window has < 180s remaining | Force exit — close both legs regardless of P&L |
+
+These thresholds are configurable in the `PositionManager` constructor.
+
+### Exit escalation
+
+When an exit is triggered, the executor follows an escalation sequence:
+
+1. **Marketable limit** — price the sell to cross the spread (when `ARB_EXIT_LIMIT_ONLY=false`)
+2. **Reprice** — cancel and resubmit at progressively more aggressive prices (`ARB_EXIT_REPRICE_ATTEMPTS` rounds)
+3. **Final dump** — submit at $0.01 on Polymarket / 1¢ on Kalshi to guarantee a fill
+
+On Polymarket specifically, sells go through a progressive size reduction (95% → 93% → 90% → 85% of held shares) because the CLOB's server-side balance cache doesn't update instantly after a buy fills. A conditional allowance refresh is called before each sell attempt.
+
+### Post-exit cooldown
+
+After every successful exit, the bot blocks re-entry into the same market/direction for `ARB_EXIT_COOLDOWN_SECONDS` (default 60s). This prevents the bot from immediately re-entering while Polymarket tokens from the previous exit are still locked in a matched order awaiting on-chain settlement.
 
 ## Dry-run to live arming
 
@@ -221,36 +240,27 @@ If any check fails, monitor/execute mode aborts with a preflight error.
 
 The bot writes structured logs under `data/`:
 
-- `trade_signals.jsonl` -- signal seen, accepted/rejected, and rejection reason
-- `trade_executions.jsonl` -- per-leg execution outcomes and errors
-- `trade_lifecycle.csv` -- position lifecycle summary and realized P&L on close
+- `trade_signals.jsonl` — signal seen, accepted/rejected, and rejection reason
+- `trade_executions.jsonl` — per-leg execution outcomes and errors
+- `trade_lifecycle.csv` — position lifecycle summary and realized P&L on close
 
 Use these for dry-run acceptance gates before enabling live mode.
 
 ## Deployment
 
-### Railway (first target)
+### Railway (primary)
 
 - `Dockerfile` is the source of truth for build/run.
 - `railway.json` configures restart policy.
 - Default runtime is safe (`ARB_DRY_RUN=true`, `ARB_ENABLE_LIVE=false`).
+- **Region matters**: Polymarket restricts trading by server location. Amsterdam (EU) works. Singapore and some other regions are close-only or blocked.
+- **Ephemeral filesystem**: Position state in `data/` is lost on every redeploy. If the bot is restarted with open positions, those positions become orphaned on the exchanges and must be closed manually.
+- Do **not** set explicit `POLY_API_KEY`/`POLY_API_SECRET`/`POLY_API_PASSPHRASE` in Railway. These are IP-bound and must be derived on the server from `POLY_PRIVATE_KEY`.
 
 ### Render parity
 
 - `render.yaml` defines a worker using the same Docker image.
 - Keep identical environment defaults to avoid behavior drift.
-
-## Operator runbook (pre-live)
-
-1. Run dry mode continuously and review telemetry quality:
-   - signal quality,
-   - filtered late-window entries,
-   - partial fill frequency,
-   - lifecycle P&L behavior.
-2. Tune strategy controls (`time gating`, `persistence`, `overround`, `liquidity`).
-3. Reduce sizing limits for first live session.
-4. Arm live mode with explicit confirm token.
-5. Watch first live session closely and disable live gate immediately if behavior deviates.
 
 ## Fee Model (Round-Trip)
 
@@ -268,29 +278,20 @@ For BTC 15-minute monitoring, the important distinction is:
 - midpoint spread is useful for observing dislocations,
 - executable edge is the relevant measure for whether a trade is actually there.
 
-## Exit Logic
-
-The position manager watches each open position and signals an exit in two cases:
-
-| Signal | Trigger | Action |
-|---|---|---|
-| **Target** | Spread compresses by 60% of entry width | Take profit -- close both legs |
-| **Stop-loss** | Spread widens by 50% beyond entry width | Cut losses -- close both legs |
-
-These thresholds are configurable. The target/stop percentages are set in the `PositionManager` constructor and can be tuned as you observe real spread behavior.
-
 ## Risk Considerations
 
 | Risk | Description | Mitigation |
 |---|---|---|
-| **Execution** | One leg fills, the other fails | Emergency stop plus best-effort flatten of the exposed leg when partial fills are disabled |
+| **Execution** | One leg fills, the other fails | Emergency stop + best-effort flatten of the exposed leg when partial fills are disabled |
 | **Liquidity** | Thin books cause slippage | Position sizing is conservative; scan checks book depth |
-| **Timing** | Prices move between placing both orders | Orders placed near-simultaneously; limit orders prevent overpay |
-| **Overround / underround** | Venue totals may not sum to `1.00`, especially on Polymarket | Log both sides directly; do not force synthetic complementarity on research data |
+| **Timing** | Prices move between placing both orders | Marketable-limit orders placed near-simultaneously |
+| **Overround / underround** | Venue totals may not sum to `1.00`, especially on Polymarket | Log both sides directly; do not force synthetic complementarity |
 | **Spread widening** | Spread moves against you after entry | Stop-loss exit signal triggers at configured threshold |
 | **Fee changes** | Platform fee structures can change | Fee rates are configurable constants |
 | **Matching** | False positive on different events | Manual pair verification before live; entity-aware scoring |
+| **Polymarket balance cache** | CLOB's server-side balance doesn't update instantly after buys fill, causing sell failures | Conditional allowance refresh + progressive sell-size reduction (95% → 85%) + post-exit cooldown |
+| **Token settlement locking** | Polymarket tokens stay locked in matched orders until on-chain settlement completes | 60s post-exit cooldown blocks re-entry; prevents double-spending locked tokens |
+| **Position orphaning** | Railway redeploys wipe in-container state; open positions become stranded on exchanges | Position file persists locally; Railway needs a mounted volume or external state store to survive redeploys |
+| **Region restrictions** | Polymarket blocks trading from certain server locations | Deploy to Amsterdam or US regions; avoid Singapore and restricted jurisdictions |
 
 **Always start with `ARB_DRY_RUN=true`** and validate matching, pricing, and exit signals before committing real capital.
-
-Live safeguard note: when `ARB_ALLOW_PARTIAL_FILLS=false`, a one-sided live fill now triggers an emergency stop, attempts a best-effort flatten of the exposed leg, and blocks new entries until restart.
