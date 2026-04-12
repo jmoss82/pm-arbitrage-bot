@@ -235,7 +235,7 @@ class ArbExecutor:
         cooldown_until = self._stop_loss_cooldowns.get(cooldown_key, 0)
         remaining = cooldown_until - time.time()
         if remaining > 0:
-            msg = f"stop-loss cooldown ({remaining:.0f}s remaining)"
+            msg = f"post-exit cooldown ({remaining:.0f}s remaining)"
             logger.info("ENTER blocked: %s — %s", opp.pair.label, msg)
             return TradeResult(
                 action="entry",
@@ -431,11 +431,10 @@ class ArbExecutor:
 
         if result.both_filled:
             self.positions.close_position(pos.id, pos.unrealized_pnl, reason=reason)
-            if reason == "stop_loss":
-                cooldown_key = f"{pos.kalshi_ticker}:{pos.direction}"
-                cooldown_sec = config.ARB_STOP_LOSS_COOLDOWN_SECONDS
-                self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
-                logger.info("Stop-loss cooldown: %s blocked for %ds", cooldown_key, cooldown_sec)
+            cooldown_key = f"{pos.kalshi_ticker}:{pos.direction}"
+            cooldown_sec = config.ARB_EXIT_COOLDOWN_SECONDS
+            self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
+            logger.info("Post-exit cooldown: %s blocked for %ds (reason: %s)", cooldown_key, cooldown_sec, reason)
         elif result.one_leg_only:
             self._warn_partial("EXIT", label, result)
             if not self.allow_partials:
