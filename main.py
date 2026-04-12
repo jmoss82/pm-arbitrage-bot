@@ -20,6 +20,7 @@ import logging
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -153,7 +154,7 @@ def _preflight_or_raise(executor: ArbExecutor, mode_label: str):
 
 
 # -- Shared helpers ------------------------------------------------------------
-EDT = timezone(timedelta(hours=-4))
+EASTERN = ZoneInfo("America/New_York")
 
 
 def _btc15_window_boundaries(dt_utc: datetime | None = None) -> tuple[datetime, datetime]:
@@ -167,7 +168,7 @@ def _btc15_window_boundaries(dt_utc: datetime | None = None) -> tuple[datetime, 
 
 def _btc15_market_ids(dt_utc: datetime | None = None) -> dict:
     start, end = _btc15_window_boundaries(dt_utc)
-    end_edt = end.astimezone(EDT)
+    end_edt = end.astimezone(EASTERN)
     event_ticker = f"KXBTC15M-{end_edt.strftime('%y%b%d%H%M').upper()}"
     mm = end_edt.strftime("%M")
     market_ticker = f"{event_ticker}-{mm}"
@@ -176,7 +177,7 @@ def _btc15_market_ids(dt_utc: datetime | None = None) -> dict:
         "window_start": start,
         "window_end": end,
         "window_key": start.isoformat(),
-        "window_label": f"{start.astimezone(EDT).strftime('%I:%M')}-{end.astimezone(EDT).strftime('%I:%M %p')}",
+        "window_label": f"{start.astimezone(EASTERN).strftime('%I:%M')}-{end.astimezone(EASTERN).strftime('%I:%M %p')}",
         "kalshi_event_ticker": event_ticker,
         "kalshi_ticker": market_ticker,
         "poly_slug": poly_slug,
@@ -480,7 +481,12 @@ async def cmd_monitor(args):
                     timing_ok, timing_reason = _entry_timing_allowed(opp.pair.label)
                     quality_ok, quality_reason = _opportunity_passes_quality_filters(opp)
                     already_open = pos_mgr.has_open_position(opp.pair.kalshi_ticker, opp.direction.value)
-                    if not (timing_ok and quality_ok) or already_open:
+                    cooldown_reason = (
+                        executor.entry_block_reason(opp.pair.kalshi_ticker, opp.direction.value)
+                        if executor and not args.scan_only
+                        else None
+                    )
+                    if not (timing_ok and quality_ok) or already_open or cooldown_reason:
                         entry_streaks[key] = 0
                         log_signal({
                             "pair": opp.pair.label,
@@ -492,6 +498,7 @@ async def cmd_monitor(args):
                             "reason": (
                                 "matching-position-open"
                                 if already_open
+                                else cooldown_reason if cooldown_reason
                                 else timing_reason if not timing_ok else quality_reason
                             ),
                         })
@@ -582,31 +589,38 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
         pass
 
     try:
-        poly_bid, poly_ask = poly.get_best_prices(pos.poly_token_yes)
-        snap.poly_yes_bid = poly_bid
-        snap.poly_yes_ask = poly_ask
-        if poly_bid is not None:
-            snap.poly_no_ask = 1.0 - poly_bid
-        if poly_ask is not None:
-            snap.poly_no_bid = 1.0 - poly_ask
+        quotes = poly.get_market_quotes(
+            pos.poly_token_yes,
+            pos.poly_token_no,
+            allow_midpoint_fallback=False,
+        )
+        snap.poly_yes_bid = quotes.get("yes_bid")
+        snap.poly_yes_ask = quotes.get("yes_ask")
+        snap.poly_no_bid = quotes.get("no_bid")
+        snap.poly_no_ask = quotes.get("no_ask")
     except Exception:
         pass
 
     pos.last_update = time.time()
 
-    k_mid = snap.kalshi_yes_mid
-    p_mid = snap.poly_yes_mid
-
     if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
-        pos.current_yes_bid = snap.poly_yes_bid or 0
-        pos.current_no_bid = snap.kalshi_no_bid or 0
-        if k_mid is not None and p_mid is not None:
-            pos.current_spread = max(0, k_mid - p_mid)
+        if snap.poly_yes_bid is not None and snap.kalshi_no_bid is not None:
+            pos.current_yes_bid = snap.poly_yes_bid
+            pos.current_no_bid = snap.kalshi_no_bid
+            pos.current_spread = max(
+                0,
+                (pos.current_yes_bid + pos.current_no_bid)
+                - (pos.yes_entry_price + pos.no_entry_price),
+            )
     else:
-        pos.current_yes_bid = snap.kalshi_yes_bid or 0
-        pos.current_no_bid = snap.poly_no_bid or 0
-        if k_mid is not None and p_mid is not None:
-            pos.current_spread = max(0, p_mid - k_mid)
+        if snap.kalshi_yes_bid is not None and snap.poly_no_bid is not None:
+            pos.current_yes_bid = snap.kalshi_yes_bid
+            pos.current_no_bid = snap.poly_no_bid
+            pos.current_spread = max(
+                0,
+                (pos.current_yes_bid + pos.current_no_bid)
+                - (pos.yes_entry_price + pos.no_entry_price),
+            )
 
     exit_yes = pos.current_yes_bid or pos.yes_entry_price
     exit_no = pos.current_no_bid or pos.no_entry_price
@@ -660,8 +674,9 @@ async def cmd_execute(args):
     for opp in opps:
         timing_ok, timing_reason = _entry_timing_allowed(opp.pair.label)
         quality_ok, quality_reason = _opportunity_passes_quality_filters(opp)
-        if not (timing_ok and quality_ok):
-            reason = timing_reason if not timing_ok else quality_reason
+        cooldown_reason = executor.entry_block_reason(opp.pair.kalshi_ticker, opp.direction.value)
+        if not (timing_ok and quality_ok) or cooldown_reason:
+            reason = cooldown_reason if cooldown_reason else timing_reason if not timing_ok else quality_reason
             print(f"\n  Skipping {opp.pair.label}: {reason}")
             log_signal({
                 "pair": opp.pair.label,

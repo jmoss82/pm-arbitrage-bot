@@ -68,6 +68,12 @@ class PriceSnapshot:
         return self.poly_yes_bid or self.poly_yes_ask
 
     @property
+    def poly_no_mid(self) -> float | None:
+        if self.poly_no_bid is not None and self.poly_no_ask is not None:
+            return (self.poly_no_bid + self.poly_no_ask) / 2
+        return self.poly_no_bid or self.poly_no_ask
+
+    @property
     def mid_spread(self) -> float | None:
         """Midpoint spread: how far apart the two platforms are at mid."""
         if self.kalshi_yes_mid is not None and self.poly_yes_mid is not None:
@@ -192,13 +198,15 @@ def fetch_snapshot(
         logger.warning("Kalshi book fetch failed for %s: %s", pair.kalshi.ticker, e)
 
     try:
-        poly_yes_bid, poly_yes_ask = poly.get_best_prices(pair.poly.token_yes)
-        snap.poly_yes_bid = poly_yes_bid
-        snap.poly_yes_ask = poly_yes_ask
-        if poly_yes_bid is not None:
-            snap.poly_no_ask = 1.0 - poly_yes_bid
-        if poly_yes_ask is not None:
-            snap.poly_no_bid = 1.0 - poly_yes_ask
+        quotes = poly.get_market_quotes(
+            pair.poly.token_yes,
+            pair.poly.token_no,
+            allow_midpoint_fallback=False,
+        )
+        snap.poly_yes_bid = quotes.get("yes_bid")
+        snap.poly_yes_ask = quotes.get("yes_ask")
+        snap.poly_no_bid = quotes.get("no_bid")
+        snap.poly_no_ask = quotes.get("no_ask")
     except Exception as e:
         logger.warning("Poly price fetch failed for %s: %s", pair.poly.question[:30], e)
 
@@ -218,80 +226,88 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
     best: SpreadOpportunity | None = None
 
     # Direction 1: Kalshi YES is higher -> buy YES on Poly (cheap), buy NO on Kalshi
-    if (snapshot.poly_yes_ask is not None and snapshot.kalshi_yes_bid is not None
-            and snapshot.kalshi_yes_bid > snapshot.poly_yes_ask):
-        spread = snapshot.kalshi_yes_bid - snapshot.poly_yes_ask
-        entry_yes = snapshot.poly_yes_ask               # buy YES on Poly
-        entry_no = 1.0 - snapshot.kalshi_yes_bid         # buy NO on Kalshi (= sell YES at their bid)
+    if (
+        snapshot.poly_yes_ask is not None
+        and snapshot.poly_yes_bid is not None
+        and snapshot.kalshi_no_ask is not None
+        and snapshot.kalshi_no_bid is not None
+    ):
+        entry_yes = snapshot.poly_yes_ask
+        entry_no = snapshot.kalshi_no_ask
         entry_cost = entry_yes + entry_no
-
-        # If spread fully closes, both positions gain. Estimate exit at midpoint convergence.
-        # YES we bought at entry_yes, could sell at ~entry_yes + spread/2
-        # NO we bought at entry_no, could sell at ~entry_no + spread/2
-        # Simplified: full convergence means exit proceeds = entry_cost + spread
-        est_exit = entry_cost + spread
-        fees = estimate_entry_exit_fees_simple(spread, "polymarket")
+        est_exit = snapshot.poly_yes_bid + snapshot.kalshi_no_bid
+        spread = est_exit - entry_cost
+        fees = estimate_round_trip_fees(
+            entry_yes, entry_no, snapshot.poly_yes_bid, snapshot.kalshi_no_bid, "polymarket"
+        )
         net = spread - fees
 
-        opp = SpreadOpportunity(
-            pair=snapshot.pair,
-            direction=SpreadDirection.KALSHI_HIGHER,
-            snapshot=snapshot,
-            spread_width=spread,
-            entry_cost_per_contract=entry_cost,
-            est_exit_proceeds=est_exit,
-            est_round_trip_fees=fees,
-            net_edge=net,
-            cheap_yes_price=entry_yes,
-            expensive_no_price=entry_no,
-            cheap_yes_platform="polymarket",
-            expensive_no_platform="kalshi",
-            poly_total=(snapshot.poly_yes_mid + (snapshot.poly_no_bid + snapshot.poly_no_ask) / 2)
-            if snapshot.poly_yes_mid is not None and snapshot.poly_no_bid is not None and snapshot.poly_no_ask is not None
-            else None,
-            kalshi_total=(snapshot.kalshi_yes_mid + (snapshot.kalshi_no_bid + snapshot.kalshi_no_ask) / 2)
-            if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
-            else None,
-            kalshi_leg_available_qty=snapshot.kalshi_no_ask_qty,
-        )
-        if best is None or opp.net_edge > best.net_edge:
-            best = opp
+        if spread > 0:
+            opp = SpreadOpportunity(
+                pair=snapshot.pair,
+                direction=SpreadDirection.KALSHI_HIGHER,
+                snapshot=snapshot,
+                spread_width=spread,
+                entry_cost_per_contract=entry_cost,
+                est_exit_proceeds=est_exit,
+                est_round_trip_fees=fees,
+                net_edge=net,
+                cheap_yes_price=entry_yes,
+                expensive_no_price=entry_no,
+                cheap_yes_platform="polymarket",
+                expensive_no_platform="kalshi",
+                poly_total=(snapshot.poly_yes_mid + snapshot.poly_no_mid)
+                if snapshot.poly_yes_mid is not None and snapshot.poly_no_mid is not None
+                else None,
+                kalshi_total=(snapshot.kalshi_yes_mid + (snapshot.kalshi_no_bid + snapshot.kalshi_no_ask) / 2)
+                if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
+                else None,
+                kalshi_leg_available_qty=snapshot.kalshi_no_ask_qty,
+            )
+            if best is None or opp.net_edge > best.net_edge:
+                best = opp
 
     # Direction 2: Poly YES is higher -> buy YES on Kalshi (cheap), buy NO on Poly
-    if (snapshot.kalshi_yes_ask is not None and snapshot.poly_yes_bid is not None
-            and snapshot.poly_yes_bid > snapshot.kalshi_yes_ask):
-        spread = snapshot.poly_yes_bid - snapshot.kalshi_yes_ask
-        entry_yes = snapshot.kalshi_yes_ask               # buy YES on Kalshi
-        entry_no = 1.0 - snapshot.poly_yes_bid             # buy NO on Poly
+    if (
+        snapshot.kalshi_yes_ask is not None
+        and snapshot.kalshi_yes_bid is not None
+        and snapshot.poly_no_ask is not None
+        and snapshot.poly_no_bid is not None
+    ):
+        entry_yes = snapshot.kalshi_yes_ask
+        entry_no = snapshot.poly_no_ask
         entry_cost = entry_yes + entry_no
-
-        est_exit = entry_cost + spread
-        fees = estimate_entry_exit_fees_simple(spread, "kalshi")
+        est_exit = snapshot.kalshi_yes_bid + snapshot.poly_no_bid
+        spread = est_exit - entry_cost
+        fees = estimate_round_trip_fees(
+            entry_yes, entry_no, snapshot.kalshi_yes_bid, snapshot.poly_no_bid, "kalshi"
+        )
         net = spread - fees
 
-        opp = SpreadOpportunity(
-            pair=snapshot.pair,
-            direction=SpreadDirection.POLY_HIGHER,
-            snapshot=snapshot,
-            spread_width=spread,
-            entry_cost_per_contract=entry_cost,
-            est_exit_proceeds=est_exit,
-            est_round_trip_fees=fees,
-            net_edge=net,
-            cheap_yes_price=entry_yes,
-            expensive_no_price=entry_no,
-            cheap_yes_platform="kalshi",
-            expensive_no_platform="polymarket",
-            poly_total=(snapshot.poly_yes_mid + (snapshot.poly_no_bid + snapshot.poly_no_ask) / 2)
-            if snapshot.poly_yes_mid is not None and snapshot.poly_no_bid is not None and snapshot.poly_no_ask is not None
-            else None,
-            kalshi_total=(snapshot.kalshi_yes_mid + (snapshot.kalshi_no_bid + snapshot.kalshi_no_ask) / 2)
-            if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
-            else None,
-            kalshi_leg_available_qty=snapshot.kalshi_yes_ask_qty,
-        )
-        if best is None or opp.net_edge > best.net_edge:
-            best = opp
+        if spread > 0:
+            opp = SpreadOpportunity(
+                pair=snapshot.pair,
+                direction=SpreadDirection.POLY_HIGHER,
+                snapshot=snapshot,
+                spread_width=spread,
+                entry_cost_per_contract=entry_cost,
+                est_exit_proceeds=est_exit,
+                est_round_trip_fees=fees,
+                net_edge=net,
+                cheap_yes_price=entry_yes,
+                expensive_no_price=entry_no,
+                cheap_yes_platform="kalshi",
+                expensive_no_platform="polymarket",
+                poly_total=(snapshot.poly_yes_mid + snapshot.poly_no_mid)
+                if snapshot.poly_yes_mid is not None and snapshot.poly_no_mid is not None
+                else None,
+                kalshi_total=(snapshot.kalshi_yes_mid + (snapshot.kalshi_no_bid + snapshot.kalshi_no_ask) / 2)
+                if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
+                else None,
+                kalshi_leg_available_qty=snapshot.kalshi_yes_ask_qty,
+            )
+            if best is None or opp.net_edge > best.net_edge:
+                best = opp
 
     return best
 

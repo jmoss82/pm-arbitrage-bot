@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -22,7 +23,7 @@ from kalshi_client import KalshiClient
 from polymarket_client import PolymarketClient
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-EDT = timezone(timedelta(hours=-4))
+EASTERN = ZoneInfo("America/New_York")
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ def _window_boundaries(dt_utc=None):
 
 
 def _window_label(start_utc):
-    edt = start_utc.astimezone(EDT)
+    edt = start_utc.astimezone(EASTERN)
     end_edt = edt + timedelta(minutes=15)
     return f"{edt.strftime('%I:%M')}-{end_edt.strftime('%I:%M %p')}"
 
@@ -74,7 +75,7 @@ class WindowState:
 
     def _try_kalshi(self, kalshi: KalshiClient, window_end_utc):
         """Construct the expected Kalshi ticker and verify it has an orderbook."""
-        end_edt = window_end_utc.astimezone(EDT)
+        end_edt = window_end_utc.astimezone(EASTERN)
         event_ticker = f"KXBTC15M-{end_edt.strftime('%y%b%d%H%M').upper()}"
         mm = end_edt.strftime("%M")
         market_ticker = f"{event_ticker}-{mm}"

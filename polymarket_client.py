@@ -220,7 +220,11 @@ class PolymarketClient:
         except Exception:
             return None
 
-    def get_best_prices(self, token_id: str) -> tuple[float | None, float | None]:
+    def get_best_prices(
+        self,
+        token_id: str,
+        allow_midpoint_fallback: bool = True,
+    ) -> tuple[float | None, float | None]:
         """
         Return (best_bid, best_ask) for a token.
 
@@ -253,11 +257,11 @@ class PolymarketClient:
             # Use midpoint as the effective price instead.
             if best_bid is not None and best_ask is not None:
                 book_spread = best_ask - best_bid
-                if book_spread > 0.20 and mid is not None:
+                if allow_midpoint_fallback and book_spread > 0.20 and mid is not None:
                     best_bid = mid - 0.005
                     best_ask = mid + 0.005
 
-            elif mid is not None:
+            elif allow_midpoint_fallback and mid is not None:
                 best_bid = mid - 0.005
                 best_ask = mid + 0.005
 
@@ -265,6 +269,22 @@ class PolymarketClient:
         except Exception as e:
             logger.warning("Failed to get prices for %s: %s", token_id[:12], e)
             return None, None
+
+    def get_market_quotes(
+        self,
+        token_yes: str,
+        token_no: str,
+        allow_midpoint_fallback: bool = True,
+    ) -> dict[str, float | None]:
+        """Return best bid/ask quotes for both outcome tokens."""
+        yes_bid, yes_ask = self.get_best_prices(token_yes, allow_midpoint_fallback=allow_midpoint_fallback)
+        no_bid, no_ask = self.get_best_prices(token_no, allow_midpoint_fallback=allow_midpoint_fallback)
+        return {
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+        }
 
     # ── Order Execution (CLOB — sync) ────────────────────────────────────
 
@@ -300,6 +320,32 @@ class PolymarketClient:
 
     def get_order(self, order_id: str) -> dict:
         return self.clob.get_order(order_id)
+
+    def get_order_fill_state(self, order_id: str) -> tuple[bool, bool, str]:
+        """Return (filled, partial, normalized_status) for an order."""
+        order = self.get_order(order_id) or {}
+        status = str(order.get("status", "")).lower()
+        size_matched = order.get("size_matched") or order.get("matchedSize") or order.get("filled_size")
+        original_size = order.get("original_size") or order.get("size")
+
+        try:
+            matched = float(size_matched) if size_matched is not None else 0.0
+        except (TypeError, ValueError):
+            matched = 0.0
+        try:
+            total = float(original_size) if original_size is not None else 0.0
+        except (TypeError, ValueError):
+            total = 0.0
+
+        if status in {"filled", "matched", "executed", "complete", "completed"}:
+            return True, False, status
+        if status in {"partially_filled", "partial", "partially matched"}:
+            return False, True, status
+        if total > 0 and matched >= total:
+            return True, False, status or "filled"
+        if matched > 0:
+            return False, True, status or "partial"
+        return False, False, status or "posted"
 
     # ── Balance / Positions ──────────────────────────────────────────────
 

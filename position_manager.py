@@ -157,22 +157,25 @@ class PositionManager:
         if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
             # We hold YES on Poly, NO on Kalshi.
             # Current spread = kalshi_yes_mid - poly_yes_mid (should be narrowing)
-            if snapshot.poly_yes_bid is not None and snapshot.kalshi_yes_ask is not None:
+            if snapshot.poly_yes_bid is not None and snapshot.kalshi_no_bid is not None:
                 # What we'd get if we sold now:
-                pos.current_yes_bid = snapshot.poly_yes_bid  # sell our Poly YES
-                pos.current_no_bid = snapshot.kalshi_no_bid or 0  # sell our Kalshi NO
-                # Current spread from bids (what we'd actually capture on exit)
-                k_mid = snapshot.kalshi_yes_mid or 0
-                p_mid = snapshot.poly_yes_mid or 0
-                pos.current_spread = max(0, k_mid - p_mid)
+                pos.current_yes_bid = snapshot.poly_yes_bid
+                pos.current_no_bid = snapshot.kalshi_no_bid
+                pos.current_spread = max(
+                    0,
+                    (pos.current_yes_bid + pos.current_no_bid)
+                    - (pos.yes_entry_price + pos.no_entry_price),
+                )
         else:
             # We hold YES on Kalshi, NO on Poly.
-            if snapshot.kalshi_yes_bid is not None and snapshot.poly_yes_ask is not None:
+            if snapshot.kalshi_yes_bid is not None and snapshot.poly_no_bid is not None:
                 pos.current_yes_bid = snapshot.kalshi_yes_bid
-                pos.current_no_bid = snapshot.poly_no_bid or 0
-                k_mid = snapshot.kalshi_yes_mid or 0
-                p_mid = snapshot.poly_yes_mid or 0
-                pos.current_spread = max(0, p_mid - k_mid)
+                pos.current_no_bid = snapshot.poly_no_bid
+                pos.current_spread = max(
+                    0,
+                    (pos.current_yes_bid + pos.current_no_bid)
+                    - (pos.yes_entry_price + pos.no_entry_price),
+                )
 
         # Unrealized P&L: what we'd net if we exited right now
         exit_yes = pos.current_yes_bid or pos.yes_entry_price
