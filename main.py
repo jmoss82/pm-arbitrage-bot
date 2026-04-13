@@ -90,6 +90,9 @@ def _entry_timing_allowed(pair_label: str) -> tuple[bool, str]:
         return False, f"too-early({sec}s)"
     if sec > config.ARB_ENTRY_MAX_SECONDS_IN_WINDOW:
         return False, f"too-late({sec}s)"
+    remaining = 900 - sec
+    if remaining <= config.ARB_FORCE_EXIT_SECONDS_REMAINING:
+        return False, f"inside-force-exit-zone({remaining}s remaining)"
     return True, "ok"
 
 
