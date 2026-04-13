@@ -58,6 +58,7 @@ What's built:
 - [x] **Spread scanner** - Detects executable cross-platform price divergences using real YES/NO books and estimates round-trip fees for entry + exit
 - [x] **Position manager** - Tracks open arb positions, monitors spread compression, generates exit signals (target hit, stop-loss, or time stop)
 - [x] **Arb executor** - Handles entry and exit on both platforms with marketable-limit orders, entry fill verification, escalating exit logic, and emergency flatten
+- [x] **REST latency tuning** - Kalshi and Polymarket snapshot fetches run in parallel, the monitor loop targets a fixed scan cadence, and live Polymarket quotes skip midpoint lookups
 - [x] **CLI with 7 modes** - `discover`, `match`, `scan`, `monitor`, `execute`, `positions`, `status`
 - [x] **Persistence** - Open positions saved to `data/open_positions.json` (survives restarts locally; ephemeral on Railway/Docker unless a volume is mounted)
 - [x] **BTC 15-minute monitor** - Auto-discovers active BTC windows, logs midpoint spreads, executable edge, and venue overround
@@ -218,6 +219,9 @@ These thresholds are configurable in the `PositionManager` constructor.
 - Entry decisions are based on visible executable quotes only. The live scanner requires real YES and NO quotes on Polymarket and does not use midpoint fallback prices.
 - A position is only opened after both venue legs are confirmed filled. Posted or resting entry orders are cancelled after the entry timeout and are not treated as open arb positions.
 - Open-position P&L and spread tracking use exitable bids for the held YES and held NO legs rather than midpoint-only divergence.
+- Monitor mode now targets a fixed scan cadence. It sleeps only for the remainder of `ARB_SCAN_INTERVAL` after each loop rather than doing `scan work + full interval`.
+- Snapshot fetches are partially parallelized: Kalshi market data and the Polymarket quote pass run concurrently, but Polymarket YES/NO book reads stay single-threaded inside one client because concurrent CLOB reads proved unstable in production.
+- Polymarket quote reads now retry briefly on request exceptions before the scan gives up on that venue for the current cycle.
 
 ### Exit escalation
 
@@ -286,6 +290,18 @@ For BTC 15-minute monitoring, the important distinction is:
 
 - midpoint spread is useful for observing dislocations,
 - executable edge is the relevant measure for whether a trade is actually there.
+
+## API / Polling Behavior
+
+The live runtime is still REST-based.
+
+- `ARB_SCAN_INTERVAL` controls the target scan cadence.
+- In BTC-only mode, each scan reads one Kalshi orderbook and both Polymarket outcome books for the active window.
+- Kalshi and Polymarket are fetched in parallel at the snapshot level.
+- Polymarket quote reads use a small retry/backoff on transient request failures.
+- Market identity refresh is lightweight and only happens when the 15-minute BTC window rolls over or when the active pair has not been discovered yet.
+
+This keeps the bot materially faster than earlier builds while avoiding the instability seen with fully concurrent Polymarket CLOB reads through a shared client.
 
 ## Risk Considerations
 
