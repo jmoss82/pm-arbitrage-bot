@@ -4,6 +4,7 @@ and Data API queries behind a single interface for the arbitrage engine.
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
+_QUOTE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="poly-quotes")
 
 
 def _mask_value(value: str | None, prefix: int = 6, suffix: int = 4) -> str:
@@ -237,9 +239,9 @@ class PolymarketClient:
         too sparse (spread > 20%), fall back to midpoint +/- a small buffer.
         """
         try:
-            mid = self.get_midpoint(token_id)
+            mid = self.get_midpoint(token_id) if allow_midpoint_fallback else None
 
-            book = self.clob.get_order_book(token_id)
+            book = self.get_orderbook(token_id)
             bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
             asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
 
@@ -283,8 +285,18 @@ class PolymarketClient:
         allow_midpoint_fallback: bool = True,
     ) -> dict[str, float | None]:
         """Return best bid/ask quotes for both outcome tokens."""
-        yes_bid, yes_ask = self.get_best_prices(token_yes, allow_midpoint_fallback=allow_midpoint_fallback)
-        no_bid, no_ask = self.get_best_prices(token_no, allow_midpoint_fallback=allow_midpoint_fallback)
+        yes_future = _QUOTE_EXECUTOR.submit(
+            self.get_best_prices,
+            token_yes,
+            allow_midpoint_fallback,
+        )
+        no_future = _QUOTE_EXECUTOR.submit(
+            self.get_best_prices,
+            token_no,
+            allow_midpoint_fallback,
+        )
+        yes_bid, yes_ask = yes_future.result()
+        no_bid, no_ask = no_future.result()
         return {
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,

@@ -407,6 +407,7 @@ async def cmd_monitor(args):
         entry_streaks: dict[str, int] = {}
 
         while True:
+            loop_started = time.perf_counter()
             scan_count += 1
             ts = time.strftime("%H:%M:%S")
 
@@ -448,12 +449,12 @@ async def cmd_monitor(args):
             if executor and executor.emergency_stop:
                 if scan_count % 12 == 1:
                     print(f"  [{ts}] ENTRY HALTED: {executor.emergency_reason}")
-                await asyncio.sleep(interval)
+                await asyncio.sleep(max(0, interval - (time.perf_counter() - loop_started)))
                 continue
 
             if config.ARB_BTC15_ONLY:
                 ids = _btc15_market_ids()
-                if ids["window_key"] != btc_window_key or btc_pair is None or scan_count % 8 == 1:
+                if ids["window_key"] != btc_window_key or btc_pair is None:
                     btc_pair, ids, reason = await _fetch_btc15_pair(kalshi, session)
                     if ids["window_key"] != btc_window_key:
                         btc_window_key = ids["window_key"]
@@ -557,13 +558,13 @@ async def cmd_monitor(args):
                 if config.ARB_BTC15_ONLY and btc_pair:
                     print(f"      {_btc_diag_line(snap, single)}")
 
-            await asyncio.sleep(interval)
-
             # Refresh markets every 50 scans (non-BTC-only mode)
             if (not config.ARB_BTC15_ONLY) and scan_count % 50 == 0:
                 pairs = await _fetch_and_match(kalshi)
                 tradeable = [p for p in pairs if p.kalshi_market]
                 print(f"  [{time.strftime('%H:%M:%S')}] Refreshed: {len(tradeable)} tradeable pairs")
+
+            await asyncio.sleep(max(0, interval - (time.perf_counter() - loop_started)))
 
     except KeyboardInterrupt:
         print("\n\n  Stopped.")

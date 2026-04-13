@@ -15,6 +15,7 @@ Round-trip cost model:
 """
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 
@@ -24,6 +25,7 @@ from polymarket_client import PolymarketClient
 from market_matcher import MarketPair
 
 logger = logging.getLogger(__name__)
+_SNAPSHOT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arb-scan")
 
 
 class SpreadDirection(Enum):
@@ -183,9 +185,23 @@ def fetch_snapshot(
 ) -> PriceSnapshot:
     snap = PriceSnapshot(pair=pair, timestamp=time.time())
 
-    try:
+    def _fetch_kalshi_book() -> dict:
         ob = kalshi.get_orderbook(pair.kalshi.ticker)
-        prices = _kalshi_book_to_prices(ob)
+        return _kalshi_book_to_prices(ob)
+
+    def _fetch_poly_quotes() -> dict[str, float | None]:
+        return poly.get_market_quotes(
+            pair.poly.token_yes,
+            pair.poly.token_no,
+            allow_midpoint_fallback=False,
+        )
+
+    started = time.perf_counter()
+    kalshi_future = _SNAPSHOT_EXECUTOR.submit(_fetch_kalshi_book)
+    poly_future = _SNAPSHOT_EXECUTOR.submit(_fetch_poly_quotes)
+
+    try:
+        prices = kalshi_future.result()
         snap.kalshi_yes_bid = prices.get("yes_bid")
         snap.kalshi_yes_ask = prices.get("yes_ask")
         snap.kalshi_no_bid = prices.get("no_bid")
@@ -198,17 +214,19 @@ def fetch_snapshot(
         logger.warning("Kalshi book fetch failed for %s: %s", pair.kalshi.ticker, e)
 
     try:
-        quotes = poly.get_market_quotes(
-            pair.poly.token_yes,
-            pair.poly.token_no,
-            allow_midpoint_fallback=False,
-        )
+        quotes = poly_future.result()
         snap.poly_yes_bid = quotes.get("yes_bid")
         snap.poly_yes_ask = quotes.get("yes_ask")
         snap.poly_no_bid = quotes.get("no_bid")
         snap.poly_no_ask = quotes.get("no_ask")
     except Exception as e:
         logger.warning("Poly price fetch failed for %s: %s", pair.poly.question[:30], e)
+
+    logger.debug(
+        "Snapshot latency for %s: %.0fms",
+        pair.kalshi.ticker,
+        (time.perf_counter() - started) * 1000,
+    )
 
     return snap
 
