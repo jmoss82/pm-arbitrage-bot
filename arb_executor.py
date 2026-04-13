@@ -567,10 +567,12 @@ class ArbExecutor:
 
         self.poly.refresh_conditional_allowance(token_id)
 
-        # Try progressively smaller sizes.  Taker fees on entry mean we
-        # received fewer shares than the nominal count, and the CLOB's
-        # balance cache can be stale on top of that.
-        size_factors = [_POLY_SELL_SIZE_FACTOR, 0.93, 0.90, 0.85]
+        # Try the full amount first, then progressively smaller sizes.
+        # Taker fees on entry mean we may have received fewer shares than
+        # the nominal count, and the CLOB's balance cache can be stale on
+        # top of that.  Starting at 1.0 avoids leaving residual positions
+        # when the full sell actually goes through.
+        size_factors = [1.0, _POLY_SELL_SIZE_FACTOR, 0.93, 0.90, 0.85]
 
         for size_factor in size_factors:
             sell_size = math.floor(contracts * size_factor * 1000) / 1000
