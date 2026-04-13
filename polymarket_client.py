@@ -4,7 +4,7 @@ and Data API queries behind a single interface for the arbitrage engine.
 """
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import time
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
-_QUOTE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="poly-quotes")
 
 
 def _mask_value(value: str | None, prefix: int = 6, suffix: int = 4) -> str:
@@ -80,6 +79,9 @@ class PolymarketMarket:
 
 
 class PolymarketClient:
+    QUOTE_RETRIES = 2
+    QUOTE_RETRY_DELAY_SECONDS = 0.15
+
     def __init__(self, derive_keys: bool = True):
         self.clob = self._init_clob(derive_keys)
 
@@ -238,45 +240,51 @@ class PolymarketClient:
         look for the tightest standing bid/ask that bracket it.  If the book is
         too sparse (spread > 20%), fall back to midpoint +/- a small buffer.
         """
-        try:
-            mid = self.get_midpoint(token_id) if allow_midpoint_fallback else None
+        last_error = None
+        for attempt in range(self.QUOTE_RETRIES + 1):
+            try:
+                mid = self.get_midpoint(token_id) if allow_midpoint_fallback else None
 
-            book = self.get_orderbook(token_id)
-            bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
-            asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
+                book = self.get_orderbook(token_id)
+                bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
+                asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
 
-            best_bid = None
-            best_ask = None
+                best_bid = None
+                best_ask = None
 
-            if bids:
-                bid_prices = [
-                    float(level.price if hasattr(level, "price") else level["price"])
-                    for level in bids
-                ]
-                best_bid = max(bid_prices) if bid_prices else None
-            if asks:
-                ask_prices = [
-                    float(level.price if hasattr(level, "price") else level["price"])
-                    for level in asks
-                ]
-                best_ask = min(ask_prices) if ask_prices else None
+                if bids:
+                    bid_prices = [
+                        float(level.price if hasattr(level, "price") else level["price"])
+                        for level in bids
+                    ]
+                    best_bid = max(bid_prices) if bid_prices else None
+                if asks:
+                    ask_prices = [
+                        float(level.price if hasattr(level, "price") else level["price"])
+                        for level in asks
+                    ]
+                    best_ask = min(ask_prices) if ask_prices else None
 
-            # If the standing book spread is > 20%, the book is sparse.
-            # Use midpoint as the effective price instead.
-            if best_bid is not None and best_ask is not None:
-                book_spread = best_ask - best_bid
-                if allow_midpoint_fallback and book_spread > 0.20 and mid is not None:
+                # If the standing book spread is > 20%, the book is sparse.
+                # Use midpoint as the effective price instead.
+                if best_bid is not None and best_ask is not None:
+                    book_spread = best_ask - best_bid
+                    if allow_midpoint_fallback and book_spread > 0.20 and mid is not None:
+                        best_bid = mid - 0.005
+                        best_ask = mid + 0.005
+
+                elif allow_midpoint_fallback and mid is not None:
                     best_bid = mid - 0.005
                     best_ask = mid + 0.005
 
-            elif allow_midpoint_fallback and mid is not None:
-                best_bid = mid - 0.005
-                best_ask = mid + 0.005
-
-            return best_bid, best_ask
-        except Exception as e:
-            logger.warning("Failed to get prices for %s: %s", token_id[:12], e)
-            return None, None
+                return best_bid, best_ask
+            except Exception as e:
+                last_error = e
+                if attempt < self.QUOTE_RETRIES:
+                    time.sleep(self.QUOTE_RETRY_DELAY_SECONDS * (attempt + 1))
+                else:
+                    logger.warning("Failed to get prices for %s: %s", token_id[:12], e)
+        return None, None
 
     def get_market_quotes(
         self,
@@ -285,18 +293,14 @@ class PolymarketClient:
         allow_midpoint_fallback: bool = True,
     ) -> dict[str, float | None]:
         """Return best bid/ask quotes for both outcome tokens."""
-        yes_future = _QUOTE_EXECUTOR.submit(
-            self.get_best_prices,
+        yes_bid, yes_ask = self.get_best_prices(
             token_yes,
-            allow_midpoint_fallback,
+            allow_midpoint_fallback=allow_midpoint_fallback,
         )
-        no_future = _QUOTE_EXECUTOR.submit(
-            self.get_best_prices,
+        no_bid, no_ask = self.get_best_prices(
             token_no,
-            allow_midpoint_fallback,
+            allow_midpoint_fallback=allow_midpoint_fallback,
         )
-        yes_bid, yes_ask = yes_future.result()
-        no_bid, no_ask = no_future.result()
         return {
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
