@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # residual dust settles automatically at market resolution.
 # See: https://github.com/Polymarket/py-clob-client/issues/287
 _POLY_SELL_SIZE_FACTOR = config.ARB_POLY_SELL_SIZE_FACTOR
+_POLY_MIN_ORDER_SIZE = 5  # Polymarket rejects orders smaller than this
 
 
 def _poly_sell_size(contracts: int) -> float:
@@ -682,17 +683,23 @@ class ArbExecutor:
 
         self.poly.refresh_conditional_allowance(token_id)
 
-        # Try the full amount first, then progressively smaller sizes.
-        # Taker fees on entry mean we may have received fewer shares than
-        # the nominal count, and the CLOB's balance cache can be stale on
-        # top of that.  Starting at 1.0 avoids leaving residual positions
-        # when the full sell actually goes through.
+        # Build candidate sell sizes.  Start with 100%, then progressively
+        # smaller sizes to work around the CLOB balance cache bug.
+        # Skip any reduced size that falls below _POLY_MIN_ORDER_SIZE.
         size_factors = [1.0, _POLY_SELL_SIZE_FACTOR, 0.93, 0.90, 0.85]
+        sell_sizes: list[float] = []
+        for sf in size_factors:
+            sz = math.floor(contracts * sf * 1000) / 1000
+            if sz >= _POLY_MIN_ORDER_SIZE:
+                sell_sizes.append(sz)
+        if not sell_sizes:
+            sell_sizes = [float(contracts)]
 
-        for size_factor in size_factors:
-            sell_size = math.floor(contracts * size_factor * 1000) / 1000
-            if sell_size <= 0:
-                continue
+        full_size_retries = 0
+        idx = 0
+        while idx < len(sell_sizes):
+            sell_size = sell_sizes[idx]
+            balance_error = False
 
             for attempt in range(attempts + 1):
                 bid, ask = self.poly.get_best_prices(token_id)
@@ -707,17 +714,29 @@ class ArbExecutor:
                 except Exception as e:
                     err_str = str(e)
                     if "not enough balance" in err_str:
-                        logger.warning("Poly sell at %.0f%% (%s shares) balance error, reducing size", size_factor * 100, sell_size)
+                        logger.warning("Poly sell at %s shares balance error", sell_size)
                         last_meta = {"error": err_str, "status": "failed", "order_id": None}
-                        break  # try next smaller size
+                        balance_error = True
+                        break
+                    if "minimum" in err_str.lower():
+                        logger.warning("Poly sell at %s shares below platform minimum", sell_size)
+                        last_meta = {"error": err_str, "status": "failed", "order_id": None}
+                        balance_error = True
+                        break
                     raise
 
                 if isinstance(poly_result, dict) and poly_result.get("success") is False:
                     err_msg = poly_result.get("errorMsg") or str(poly_result)
                     if "not enough balance" in err_msg:
-                        logger.warning("Poly sell at %.0f%% (%s shares) balance error, reducing size", size_factor * 100, sell_size)
+                        logger.warning("Poly sell at %s shares balance error", sell_size)
                         last_meta = {"error": err_msg, "status": "failed", "order_id": None}
-                        break  # try next smaller size
+                        balance_error = True
+                        break
+                    if "minimum" in err_msg.lower():
+                        logger.warning("Poly sell at %s shares below platform minimum", sell_size)
+                        last_meta = {"error": err_msg, "status": "failed", "order_id": None}
+                        balance_error = True
+                        break
                     last_meta = {
                         "error": err_msg,
                         "status": str(poly_result.get("status", "failed")),
@@ -753,9 +772,19 @@ class ArbExecutor:
                     "status": latest_status,
                     "order_id": order_id,
                 }
-            else:
-                continue  # inner loop finished without break — no balance error
-            continue  # broke out of inner loop — try next size factor
+
+            if balance_error and sell_size == float(contracts) and full_size_retries < 3:
+                # Full-size sell failed.  If reduced sizes would be below the
+                # platform minimum, retrying at full size with an allowance
+                # refresh and a delay is our only option.
+                full_size_retries += 1
+                logger.info("Refreshing Poly allowance and retrying full size (%d/3)", full_size_retries)
+                time.sleep(1.5)
+                self.poly.refresh_conditional_allowance(token_id)
+                # Don't advance idx — retry the same full size
+                continue
+
+            idx += 1
 
         return False, last_meta
 
@@ -990,20 +1019,37 @@ class ArbExecutor:
 
     def _emergency_flatten_poly(self, token_id: str, contracts: int):
         self.poly.refresh_conditional_allowance(token_id)
-        # Try progressively smaller sizes.  The CLOB's cached balance can
-        # be significantly stale after instant-match buys, and taker fees
-        # mean we received fewer shares than the nominal contract count.
-        for factor in (0.95, 0.90, 0.85, 0.80):
-            sell_size = math.floor(contracts * factor * 1000) / 1000
-            if sell_size <= 0:
-                continue
+        # Build candidate sizes: full first, then progressively smaller.
+        # Skip any size below the platform minimum.
+        factors = [1.0, 0.95, 0.90, 0.85, 0.80]
+        sell_sizes = []
+        for f in factors:
+            sz = math.floor(contracts * f * 1000) / 1000
+            if sz >= _POLY_MIN_ORDER_SIZE:
+                sell_sizes.append(sz)
+        if not sell_sizes:
+            sell_sizes = [float(contracts)]
+
+        full_retries = 0
+        idx = 0
+        while idx < len(sell_sizes):
+            sell_size = sell_sizes[idx]
             try:
                 self.poly.sell(token_id, 0.01, sell_size)
                 logger.warning("Emergency Poly flatten submitted: token=%s size=%s price=0.01", token_id, sell_size)
                 print(f"      Emergency Poly flatten submitted @ $0.01 ({sell_size} shares)")
                 return
             except Exception as e:
-                logger.warning("Emergency Poly flatten at %.0f%% (%s shares) failed: %s", factor * 100, sell_size, e)
+                err_str = str(e)
+                logger.warning("Emergency Poly flatten at %s shares failed: %s", sell_size, e)
+                if ("not enough balance" in err_str or "minimum" in err_str.lower()) \
+                        and sell_size == float(contracts) and full_retries < 3:
+                    full_retries += 1
+                    logger.info("Emergency flatten: refreshing allowance and retrying full size (%d/3)", full_retries)
+                    time.sleep(1.5)
+                    self.poly.refresh_conditional_allowance(token_id)
+                    continue
+            idx += 1
         logger.error("Emergency Poly flatten exhausted all size attempts")
         print("      Emergency Poly flatten failed: exhausted all size attempts")
 
