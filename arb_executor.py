@@ -155,6 +155,7 @@ class ArbExecutor:
         try:
             bal = self.kalshi.get_balance()
             kalshi_usd = float(bal.get("balance", 0)) / 100.0
+            logger.info("Kalshi preflight: balance=$%.2f", kalshi_usd)
             if kalshi_usd < config.ARB_MIN_KALSHI_BALANCE_USD:
                 issues.append(
                     f"kalshi balance ${kalshi_usd:.2f} < ${config.ARB_MIN_KALSHI_BALANCE_USD:.2f}"
