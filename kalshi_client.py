@@ -164,6 +164,48 @@ class Order:
 
 
 @dataclass
+class Fill:
+    trade_id: str = ""
+    order_id: str = ""
+    ticker: str = ""
+    side: str = ""
+    action: str = ""
+    count: int = 0
+    yes_price: int = 0
+    no_price: int = 0
+    is_taker: bool = False
+    created_time: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Fill":
+        yes_cents = d.get("yes_price", 0)
+        no_cents = d.get("no_price", 0)
+        if yes_cents is None or yes_cents == 0:
+            yes_dollars = d.get("yes_price_dollars")
+            if yes_dollars:
+                yes_cents = round(float(yes_dollars) * 100)
+        if no_cents is None or no_cents == 0:
+            no_dollars = d.get("no_price_dollars")
+            if no_dollars:
+                no_cents = round(float(no_dollars) * 100)
+        count = d.get("count", 0)
+        if (count is None or count == 0) and d.get("count_fp"):
+            count = int(float(d["count_fp"]))
+        return cls(
+            trade_id=d.get("trade_id", ""),
+            order_id=d.get("order_id", ""),
+            ticker=d.get("ticker", ""),
+            side=d.get("side", ""),
+            action=d.get("action", ""),
+            count=count,
+            yes_price=yes_cents or 0,
+            no_price=no_cents or 0,
+            is_taker=bool(d.get("is_taker")),
+            created_time=d.get("created_time", ""),
+        )
+
+
+@dataclass
 class Position:
     ticker: str = ""
     position: int = 0
@@ -331,6 +373,33 @@ class KalshiClient:
         data = self._request("GET", f"/portfolio/orders/{order_id}")
         order = data.get("order")
         return Order.from_dict(order) if order else None
+
+    def get_fills(self, order_id: str) -> list[Fill]:
+        """Fetch fill records for a specific order."""
+        raw = self._paginate(
+            "GET", "/portfolio/fills", "fills",
+            params={"order_id": order_id},
+        )
+        return [Fill.from_dict(f) for f in raw]
+
+    def get_order_avg_price(self, order_id: str, side: str) -> float | None:
+        """Return the volume-weighted average fill price in dollars for an order.
+
+        *side* should be ``"yes"`` or ``"no"`` (the side of the position being
+        sold).  Returns ``None`` when no fills are available.
+        """
+        fills = self.get_fills(order_id)
+        if not fills:
+            return None
+        total_cents = 0
+        total_count = 0
+        for f in fills:
+            price = f.yes_price if side == "yes" else f.no_price
+            total_cents += price * f.count
+            total_count += f.count
+        if total_count == 0:
+            return None
+        return (total_cents / total_count) / 100.0
 
     # ── Order Management ─────────────────────────────────────────────────
 

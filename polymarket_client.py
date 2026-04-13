@@ -352,6 +352,17 @@ class PolymarketClient:
     def get_order(self, order_id: str) -> dict:
         return self.clob.get_order(order_id)
 
+    def get_order_avg_fill_price(self, order_id: str) -> float | None:
+        """Return the average fill price for a filled order, or None."""
+        order = self.get_order(order_id) or {}
+        avg = order.get("average_price") or order.get("averagePrice")
+        if avg is not None:
+            try:
+                return float(avg)
+            except (TypeError, ValueError):
+                pass
+        return None
+
     def get_order_fill_state(self, order_id: str) -> tuple[bool, bool, str]:
         """Return (filled, partial, normalized_status) for an order."""
         order = self.get_order(order_id) or {}

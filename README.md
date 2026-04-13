@@ -274,6 +274,7 @@ Use these for dry-run acceptance gates before enabling live mode.
 - Default runtime is safe (`ARB_DRY_RUN=true`, `ARB_ENABLE_LIVE=false`).
 - **Region matters**: Polymarket restricts trading by server location. Amsterdam (EU) works. Singapore and some other regions are close-only or blocked.
 - **Ephemeral filesystem**: Position state in `data/` is lost on every redeploy. If the bot is restarted with open positions, those positions become orphaned on the exchanges and must be closed manually.
+- **Every push restarts the bot.** Railway rebuilds and redeploys on every commit to `main`. If the bot is holding an open position at the time of the push, the restart kills the process mid-trade — both legs may be left open on-exchange with no automated exit. **Do not push while a position is open.** All pushes should be explicitly cleared by the operator first.
 - Do **not** set explicit `POLY_API_KEY`/`POLY_API_SECRET`/`POLY_API_PASSPHRASE` in Railway. These are IP-bound and must be derived on the server from `POLY_PRIVATE_KEY`.
 
 ### Render parity

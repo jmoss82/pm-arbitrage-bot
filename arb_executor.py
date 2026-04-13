@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from kalshi_client import KalshiClient, Order as KalshiOrder
 from polymarket_client import PolymarketClient
-from arb_scanner import SpreadOpportunity, SpreadDirection, _kalshi_book_to_prices
+from arb_scanner import SpreadOpportunity, SpreadDirection, _kalshi_book_to_prices, estimate_round_trip_fees
 from position_manager import PositionManager, ArbPosition
 import config
 from trade_logger import log_execution
@@ -373,7 +373,8 @@ class ArbExecutor:
 
         if result.both_filled:
             self.ledger.daily_spent += result.total_cost_usd
-            self.positions.open_position(opp, contracts, result.total_cost_usd)
+            pos = self.positions.open_position(opp, contracts, result.total_cost_usd)
+            self._update_entry_fill_prices(pos, result, opp.direction, kalshi_side)
         elif result.one_leg_only or result.poly_partial or result.kalshi_partial:
             self._warn_partial("ENTRY", label, result)
             if not self.allow_partials:
@@ -433,6 +434,8 @@ class ArbExecutor:
 
         # Sell both legs
         poly_token, kalshi_side = self._exit_params(pos)
+        poly_meta: dict = {}
+        kalshi_meta: dict = {}
 
         # Sell on Polymarket with escalation if passive exits do not fill.
         try:
@@ -457,7 +460,10 @@ class ArbExecutor:
             logger.error("Kalshi exit failed: %s", e)
 
         if result.both_filled:
-            self.positions.close_position(pos.id, pos.unrealized_pnl, reason=reason)
+            realized = self._compute_realized_pnl(pos, poly_meta, kalshi_meta, kalshi_side)
+            logger.info("Realized P&L for %s: $%.4f (unrealized was $%.4f)",
+                        pos.id, realized, pos.unrealized_pnl)
+            self.positions.close_position(pos.id, realized, reason=reason)
             cooldown_key = f"{pos.kalshi_ticker}:{pos.direction}"
             cooldown_sec = config.ARB_EXIT_COOLDOWN_SECONDS
             self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
@@ -468,14 +474,19 @@ class ArbExecutor:
                 self._handle_exit_partial(pos, result)
 
         self.ledger.exits.append(result)
-        self._log_trade_result("exit", result, {
+        extra = {
             "pair": label,
             "reason": reason,
             "mode": "live",
             "entry_spread": pos.entry_spread,
             "current_spread": pos.current_spread,
             "unrealized_pnl": pos.unrealized_pnl,
-        })
+        }
+        if result.both_filled:
+            extra["realized_pnl"] = realized
+            extra["poly_fill_price"] = poly_meta.get("fill_price")
+            extra["kalshi_fill_price"] = kalshi_meta.get("fill_price")
+        self._log_trade_result("exit", result, extra)
         return result
 
     # -- Helpers ---------------------------------------------------------------
@@ -507,6 +518,88 @@ class ArbExecutor:
             poly_token = pos.poly_token_no
             kalshi_side = "yes"
         return poly_token, kalshi_side
+
+    def _update_entry_fill_prices(
+        self,
+        pos: ArbPosition,
+        result: TradeResult,
+        direction: SpreadDirection,
+        kalshi_side: str,
+    ):
+        """Best-effort update of entry prices with actual fills."""
+        poly_fill: float | None = None
+        kalshi_fill: float | None = None
+
+        if result.poly_order_id:
+            try:
+                poly_fill = self.poly.get_order_avg_fill_price(result.poly_order_id)
+            except Exception:
+                pass
+
+        if result.kalshi_order_id:
+            try:
+                kalshi_fill = self.kalshi.get_order_avg_price(result.kalshi_order_id, kalshi_side)
+            except Exception:
+                pass
+
+        if direction == SpreadDirection.KALSHI_HIGHER:
+            if poly_fill is not None:
+                pos.yes_entry_price = poly_fill
+            if kalshi_fill is not None:
+                pos.no_entry_price = kalshi_fill
+        else:
+            if kalshi_fill is not None:
+                pos.yes_entry_price = kalshi_fill
+            if poly_fill is not None:
+                pos.no_entry_price = poly_fill
+
+        if poly_fill is not None or kalshi_fill is not None:
+            pos.entry_cost = (pos.yes_entry_price + pos.no_entry_price) * pos.contracts
+            logger.info(
+                "Entry fill prices for %s: yes=%.4f no=%.4f (cost $%.4f)",
+                pos.id, pos.yes_entry_price, pos.no_entry_price, pos.entry_cost,
+            )
+            self.positions._save()
+
+    def _compute_realized_pnl(
+        self,
+        pos: ArbPosition,
+        poly_meta: dict,
+        kalshi_meta: dict,
+        kalshi_side: str,
+    ) -> float:
+        """Compute realized P&L from actual exit fill prices.
+
+        Falls back to the unrealized estimate when fill prices are unavailable.
+        """
+        poly_fill = poly_meta.get("fill_price")
+        kalshi_fill = kalshi_meta.get("fill_price")
+
+        if poly_fill is None and kalshi_fill is None:
+            logger.warning("No fill prices available for %s, using unrealized P&L", pos.id)
+            return pos.unrealized_pnl
+
+        if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
+            exit_yes = poly_fill if poly_fill is not None else pos.current_yes_bid or pos.yes_entry_price
+            exit_no = kalshi_fill if kalshi_fill is not None else pos.current_no_bid or pos.no_entry_price
+        else:
+            exit_yes = kalshi_fill if kalshi_fill is not None else pos.current_yes_bid or pos.yes_entry_price
+            exit_no = poly_fill if poly_fill is not None else pos.current_no_bid or pos.no_entry_price
+
+        exit_proceeds = (exit_yes + exit_no) * pos.contracts
+        fees = estimate_round_trip_fees(
+            pos.yes_entry_price, pos.no_entry_price,
+            exit_yes, exit_no,
+            pos.yes_platform,
+        ) * pos.contracts
+        realized = exit_proceeds - pos.entry_cost - fees
+        logger.info(
+            "P&L detail for %s: exit_yes=%.4f exit_no=%.4f proceeds=%.4f "
+            "entry_cost=%.4f fees=%.4f realized=%.4f",
+            pos.id, exit_yes, exit_no, exit_proceeds,
+            pos.entry_cost, fees, realized,
+        )
+        return realized
 
     def _entry_poly_price(self, opp: SpreadOpportunity, fallback_price: float) -> float:
         if not self.entry_marketable:
@@ -561,6 +654,27 @@ class ArbExecutor:
         except Exception:
             pass
         return yes_price, no_price
+
+    def _get_poly_fill_price(self, order_id: str | None, fallback: float) -> float:
+        """Best-effort average fill price for a Polymarket exit order."""
+        if not order_id:
+            return fallback
+        try:
+            avg = self.poly.get_order_avg_fill_price(order_id)
+            if avg is not None:
+                return avg
+        except Exception:
+            pass
+        return fallback
+
+    def _get_kalshi_fill_price(self, order_id: str | None, side: str) -> float | None:
+        """Best-effort average fill price (in dollars) for a Kalshi exit order."""
+        if not order_id:
+            return None
+        try:
+            return self.kalshi.get_order_avg_price(order_id, side)
+        except Exception:
+            return None
 
     def _exit_poly_with_escalation(self, token_id: str, contracts: int) -> tuple[bool, dict]:
         attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
@@ -622,11 +736,12 @@ class ArbExecutor:
                     status = str(poly_result.get("status", "posted"))
 
                 if not order_id:
-                    return True, {"order_id": None, "status": status, "error": None}
+                    return True, {"order_id": None, "status": status, "error": None, "fill_price": sell_price}
 
                 filled, latest_status = self._wait_for_poly_fill(order_id)
                 if filled:
-                    return True, {"order_id": order_id, "status": latest_status, "error": None}
+                    fill_price = self._get_poly_fill_price(order_id, sell_price)
+                    return True, {"order_id": order_id, "status": latest_status, "error": None, "fill_price": fill_price}
 
                 try:
                     self.poly.cancel(order_id)
@@ -655,7 +770,6 @@ class ArbExecutor:
                 else:
                     yes_price, no_price = None, 1
             elif attempt > 0:
-                # Escalate: reduce price by 1c per retry attempt
                 if side == "yes" and yes_price is not None:
                     yes_price = max(1, yes_price - attempt)
                 elif side == "no" and no_price is not None:
@@ -670,11 +784,13 @@ class ArbExecutor:
                 client_order_id=f"arb-x-{uuid.uuid4().hex[:8]}",
             )
             if self._kalshi_order_is_filled(order.status):
-                return True, {"order_id": order.order_id, "status": order.status, "error": None}
+                fill_price = self._get_kalshi_fill_price(order.order_id, side)
+                return True, {"order_id": order.order_id, "status": order.status, "error": None, "fill_price": fill_price}
 
             filled, latest_status = self._wait_for_kalshi_fill(order.order_id)
             if filled:
-                return True, {"order_id": order.order_id, "status": latest_status, "error": None}
+                fill_price = self._get_kalshi_fill_price(order.order_id, side)
+                return True, {"order_id": order.order_id, "status": latest_status, "error": None, "fill_price": fill_price}
 
             try:
                 self.kalshi.cancel_order(order.order_id)
