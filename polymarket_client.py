@@ -236,15 +236,16 @@ class PolymarketClient:
         books with real depth only at extreme prices.  Market makers fill
         orders just-in-time instead of posting visible quotes.
 
-        Strategy: use the midpoint from the CLOB as the reference price, then
-        look for the tightest standing bid/ask that bracket it.  If the book is
-        too sparse (spread > 20%), fall back to midpoint +/- a small buffer.
+        Strategy: read the raw order book first.  If the standing book is
+        too sparse (spread > 20%) or entirely empty, use the CLOB midpoint
+        as a fallback reference.  When ``allow_midpoint_fallback`` is False
+        the midpoint is still used as a last resort to avoid returning None
+        (which would silently block spread detection), but raw book prices
+        are always preferred.
         """
         last_error = None
         for attempt in range(self.QUOTE_RETRIES + 1):
             try:
-                mid = self.get_midpoint(token_id) if allow_midpoint_fallback else None
-
                 book = self.get_orderbook(token_id)
                 bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
                 asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
@@ -265,17 +266,25 @@ class PolymarketClient:
                     ]
                     best_ask = min(ask_prices) if ask_prices else None
 
-                # If the standing book spread is > 20%, the book is sparse.
-                # Use midpoint as the effective price instead.
                 if best_bid is not None and best_ask is not None:
                     book_spread = best_ask - best_bid
-                    if allow_midpoint_fallback and book_spread > 0.20 and mid is not None:
-                        best_bid = mid - 0.005
-                        best_ask = mid + 0.005
+                    if allow_midpoint_fallback and book_spread > 0.20:
+                        mid = self.get_midpoint(token_id)
+                        if mid is not None:
+                            best_bid = mid - 0.005
+                            best_ask = mid + 0.005
+                    return best_bid, best_ask
 
-                elif allow_midpoint_fallback and mid is not None:
-                    best_bid = mid - 0.005
-                    best_ask = mid + 0.005
+                # Book is partially or fully empty — use midpoint as
+                # last-resort fallback regardless of allow_midpoint_fallback
+                # so that spread detection still has a reference price.
+                if best_bid is None or best_ask is None:
+                    mid = self.get_midpoint(token_id)
+                    if mid is not None:
+                        if best_bid is None:
+                            best_bid = mid - 0.005
+                        if best_ask is None:
+                            best_ask = mid + 0.005
 
                 return best_bid, best_ask
             except Exception as e:

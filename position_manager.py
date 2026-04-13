@@ -151,33 +151,39 @@ class PositionManager:
     # -- Spread monitoring -----------------------------------------------------
 
     def update_position(self, pos: ArbPosition, snapshot: PriceSnapshot):
-        """Update a position's current spread from a fresh price snapshot."""
+        """Update a position's current spread from a fresh price snapshot.
+
+        current_spread tracks the cross-platform YES divergence — the same
+        metric used at entry (spread_width).  When it shrinks toward zero
+        the platforms are converging and we're profiting.
+        """
         pos.last_update = time.time()
 
-        if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
-            # We hold YES on Poly, NO on Kalshi.
-            # Current spread = kalshi_yes_mid - poly_yes_mid (should be narrowing)
-            if snapshot.poly_yes_bid is not None and snapshot.kalshi_no_bid is not None:
-                # What we'd get if we sold now:
-                pos.current_yes_bid = snapshot.poly_yes_bid
-                pos.current_no_bid = snapshot.kalshi_no_bid
-                pos.current_spread = max(
-                    0,
-                    (pos.current_yes_bid + pos.current_no_bid)
-                    - (pos.yes_entry_price + pos.no_entry_price),
-                )
-        else:
-            # We hold YES on Kalshi, NO on Poly.
-            if snapshot.kalshi_yes_bid is not None and snapshot.poly_no_bid is not None:
-                pos.current_yes_bid = snapshot.kalshi_yes_bid
-                pos.current_no_bid = snapshot.poly_no_bid
-                pos.current_spread = max(
-                    0,
-                    (pos.current_yes_bid + pos.current_no_bid)
-                    - (pos.yes_entry_price + pos.no_entry_price),
-                )
+        k_yes = snapshot.kalshi_yes_mid
+        p_yes = snapshot.poly_yes_mid
+        if k_yes is None:
+            k_yes = snapshot.kalshi_yes_bid or snapshot.kalshi_yes_ask
+        if p_yes is None:
+            p_yes = snapshot.poly_yes_bid or snapshot.poly_yes_ask
 
-        # Unrealized P&L: what we'd net if we exited right now
+        if k_yes is not None and p_yes is not None:
+            if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
+                pos.current_spread = k_yes - p_yes
+            else:
+                pos.current_spread = p_yes - k_yes
+
+        # Track exitable bids for P&L computation
+        if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
+            if snapshot.poly_yes_bid is not None:
+                pos.current_yes_bid = snapshot.poly_yes_bid
+            if snapshot.kalshi_no_bid is not None:
+                pos.current_no_bid = snapshot.kalshi_no_bid
+        else:
+            if snapshot.kalshi_yes_bid is not None:
+                pos.current_yes_bid = snapshot.kalshi_yes_bid
+            if snapshot.poly_no_bid is not None:
+                pos.current_no_bid = snapshot.poly_no_bid
+
         exit_yes = pos.current_yes_bid or pos.yes_entry_price
         exit_no = pos.current_no_bid or pos.no_entry_price
         exit_proceeds = (exit_yes + exit_no) * pos.contracts

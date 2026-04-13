@@ -90,16 +90,14 @@ class SpreadOpportunity:
     direction: SpreadDirection
     snapshot: PriceSnapshot
 
-    # The spread as we'd actually capture it (entry prices, not mids)
-    spread_width: float         # raw price gap between platforms
+    spread_width: float         # cross-platform YES divergence (executable)
     entry_cost_per_contract: float  # total cost to enter both legs
-    est_exit_proceeds: float    # what we'd get if spread fully closes
-    est_round_trip_fees: float  # entry + exit fees
-    net_edge: float             # profit if spread fully closes, after fees
+    est_round_trip_fees: float  # estimated fees if spread fully closes
+    net_edge: float             # divergence minus fees
 
     # What we'd pay on each platform to enter
     cheap_yes_price: float      # buy YES here (lower platform)
-    expensive_no_price: float   # buy NO here (higher platform), = 1 - expensive_yes_bid
+    expensive_no_price: float   # buy NO here (higher platform)
     cheap_yes_platform: str
     expensive_no_platform: str
     poly_total: float | None = None
@@ -233,41 +231,62 @@ def fetch_snapshot(
 
 # -- Spread detection ----------------------------------------------------------
 
+def _compute_divergence(snapshot: PriceSnapshot) -> tuple[float | None, float | None]:
+    """Return (kalshi_yes_ref, poly_yes_ref) using the best available prices.
+
+    Prefer executable prices (bid/ask crossing the platforms), fall back
+    to midpoints when one side of the book is missing.
+    """
+    k_yes = snapshot.kalshi_yes_mid
+    p_yes = snapshot.poly_yes_mid
+
+    if k_yes is None and snapshot.kalshi_yes_bid is not None:
+        k_yes = snapshot.kalshi_yes_bid
+    if k_yes is None and snapshot.kalshi_yes_ask is not None:
+        k_yes = snapshot.kalshi_yes_ask
+
+    if p_yes is None and snapshot.poly_yes_bid is not None:
+        p_yes = snapshot.poly_yes_bid
+    if p_yes is None and snapshot.poly_yes_ask is not None:
+        p_yes = snapshot.poly_yes_ask
+
+    return k_yes, p_yes
+
+
 def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
     """
-    Detect a tradeable spread between the two platforms.
+    Detect a tradeable cross-platform divergence.
 
-    The spread exists when one platform prices YES significantly higher
-    than the other. We enter by buying YES on the cheap side and NO
-    on the expensive side, then exit both when prices converge.
+    The spread is the gap between how the two platforms price the same
+    YES outcome.  When the divergence is large enough to cover round-trip
+    fees, we buy YES where it's cheap and NO where it's expensive, then
+    exit when prices converge.
     """
     best: SpreadOpportunity | None = None
 
-    # Direction 1: Kalshi YES is higher -> buy YES on Poly (cheap), buy NO on Kalshi
-    if (
-        snapshot.poly_yes_ask is not None
-        and snapshot.poly_yes_bid is not None
-        and snapshot.kalshi_no_ask is not None
-        and snapshot.kalshi_no_bid is not None
-    ):
-        entry_yes = snapshot.poly_yes_ask
-        entry_no = snapshot.kalshi_no_ask
-        entry_cost = entry_yes + entry_no
-        est_exit = snapshot.poly_yes_bid + snapshot.kalshi_no_bid
-        spread = est_exit - entry_cost
-        fees = estimate_round_trip_fees(
-            entry_yes, entry_no, snapshot.poly_yes_bid, snapshot.kalshi_no_bid, "polymarket"
-        )
-        net = spread - fees
+    k_yes_ref, p_yes_ref = _compute_divergence(snapshot)
+    if k_yes_ref is None or p_yes_ref is None:
+        return None
 
-        if spread > 0:
+    # Direction 1: Kalshi YES is higher -> buy YES on Poly (cheap), buy NO on Kalshi
+    # Divergence = kalshi_yes - poly_yes (positive when Kalshi prices Up higher)
+    if k_yes_ref > p_yes_ref:
+        divergence = k_yes_ref - p_yes_ref
+
+        entry_yes = snapshot.poly_yes_ask if snapshot.poly_yes_ask is not None else p_yes_ref
+        entry_no = snapshot.kalshi_no_ask if snapshot.kalshi_no_ask is not None else (1.0 - k_yes_ref)
+        entry_cost = entry_yes + entry_no
+
+        fees = estimate_entry_exit_fees_simple(divergence, "polymarket")
+        net = divergence - fees
+
+        if divergence > 0:
             opp = SpreadOpportunity(
                 pair=snapshot.pair,
                 direction=SpreadDirection.KALSHI_HIGHER,
                 snapshot=snapshot,
-                spread_width=spread,
+                spread_width=divergence,
                 entry_cost_per_contract=entry_cost,
-                est_exit_proceeds=est_exit,
                 est_round_trip_fees=fees,
                 net_edge=net,
                 cheap_yes_price=entry_yes,
@@ -286,30 +305,24 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
                 best = opp
 
     # Direction 2: Poly YES is higher -> buy YES on Kalshi (cheap), buy NO on Poly
-    if (
-        snapshot.kalshi_yes_ask is not None
-        and snapshot.kalshi_yes_bid is not None
-        and snapshot.poly_no_ask is not None
-        and snapshot.poly_no_bid is not None
-    ):
-        entry_yes = snapshot.kalshi_yes_ask
-        entry_no = snapshot.poly_no_ask
-        entry_cost = entry_yes + entry_no
-        est_exit = snapshot.kalshi_yes_bid + snapshot.poly_no_bid
-        spread = est_exit - entry_cost
-        fees = estimate_round_trip_fees(
-            entry_yes, entry_no, snapshot.kalshi_yes_bid, snapshot.poly_no_bid, "kalshi"
-        )
-        net = spread - fees
+    # Divergence = poly_yes - kalshi_yes (positive when Poly prices Up higher)
+    if p_yes_ref > k_yes_ref:
+        divergence = p_yes_ref - k_yes_ref
 
-        if spread > 0:
+        entry_yes = snapshot.kalshi_yes_ask if snapshot.kalshi_yes_ask is not None else k_yes_ref
+        entry_no = snapshot.poly_no_ask if snapshot.poly_no_ask is not None else (1.0 - p_yes_ref)
+        entry_cost = entry_yes + entry_no
+
+        fees = estimate_entry_exit_fees_simple(divergence, "kalshi")
+        net = divergence - fees
+
+        if divergence > 0:
             opp = SpreadOpportunity(
                 pair=snapshot.pair,
                 direction=SpreadDirection.POLY_HIGHER,
                 snapshot=snapshot,
-                spread_width=spread,
+                spread_width=divergence,
                 entry_cost_per_contract=entry_cost,
-                est_exit_proceeds=est_exit,
                 est_round_trip_fees=fees,
                 net_edge=net,
                 cheap_yes_price=entry_yes,

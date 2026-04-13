@@ -33,7 +33,7 @@ The dedicated monitor for this work is `btc15m_monitor.py`, which auto-discovers
 
 Runtime execution is **BTC-only by default** (`ARB_BTC15_ONLY=true`), so `scan`, `monitor`, and `execute` focus on one active BTC 15-minute window pair instead of broad multi-market matching.
 
-Important: on Polymarket, the two outcome prices do **not** reliably sum to `1.00`. They are often overround and occasionally briefly underround. The live scanner now uses the actual YES and NO books directly and does **not** synthesize `NO = 1 - YES` in the execution path. Midpoint divergence is a research signal only; executable edge is what matters for entry decisions.
+Important: on Polymarket, the two outcome prices do **not** reliably sum to `1.00`. They are often overround and occasionally briefly underround. The live scanner measures the cross-platform divergence in YES pricing directly and does **not** synthesize `NO = 1 - YES` in the execution path. When a Polymarket book is too thin to have standing quotes, the scanner falls back to the CLOB midpoint so that detection is not silently blocked.
 
 ### Why Convergence Instead of Hold-to-Resolution
 
@@ -55,7 +55,7 @@ What's built:
 - [x] **Kalshi Python client** - Full REST API with RSA-PSS request signing
 - [x] **Polymarket client** - CLOB order execution + Gamma API market discovery, runtime key derivation
 - [x] **Cross-platform market matcher** - Event-level fuzzy matching with entity extraction
-- [x] **Spread scanner** - Detects executable cross-platform price divergences using real YES/NO books and estimates round-trip fees for entry + exit
+- [x] **Spread scanner** - Detects cross-platform YES price divergences and estimates round-trip fees; uses midpoint fallback on thin books to avoid silent detection gaps
 - [x] **Position manager** - Tracks open arb positions, monitors spread compression, generates exit signals (target hit, stop-loss, or time stop)
 - [x] **Arb executor** - Handles entry and exit on both platforms with marketable-limit orders, entry fill verification, escalating exit logic, and emergency flatten
 - [x] **REST latency tuning** - Kalshi and Polymarket snapshot fetches run in parallel, the monitor loop targets a fixed scan cadence, and live Polymarket quotes skip midpoint lookups
@@ -86,7 +86,7 @@ Prediction Market Arbitrage/
 |-- kalshi_client.py         Kalshi Trade API v2 (RSA-PSS auth, REST, pagination)
 |-- polymarket_client.py     Polymarket CLOB + Gamma + Data API wrapper
 |-- market_matcher.py        Cross-platform market pairing (fuzzy + manual)
-|-- arb_scanner.py           Spread detection with round-trip fee model
+|-- arb_scanner.py           Cross-platform divergence detection with fee model
 |-- arb_executor.py          Entry + exit execution on both platforms
 |-- position_manager.py      Open position tracking, exit signals, persistence
 |-- spread_monitor.py        Single-market live spread tracker with CSV export
@@ -152,7 +152,7 @@ All settings in `.env`:
 |---|---|---|
 | `ARB_SCAN_INTERVAL` | `5` | Seconds between scans in monitor mode |
 | `ARB_BTC15_ONLY` | `true` | Restrict monitor/scan/execute to the current BTC 15-minute market pair only |
-| `ARB_MIN_EDGE` | `0.05` | Minimum spread (5 cents) to enter |
+| `ARB_MIN_EDGE` | `0.05` | Minimum net edge (divergence minus fees) to enter |
 | `ARB_MAX_POSITION_USD` | `50.0` | Max USD per position (both legs combined) |
 | `ARB_MAX_DAILY_SPEND` | `500.0` | Daily spend cap across all entries |
 | `ARB_DRY_RUN` | `true` | Paper trading mode. Keep `true` during calibration |
@@ -204,21 +204,21 @@ All settings in `.env`:
 
 ## Exit Logic
 
-The position manager watches each open position and signals an exit in these cases:
+The position manager tracks the live cross-platform YES divergence for each open position — the same metric used at entry. It signals an exit when:
 
 | Signal | Trigger | Action |
 |---|---|---|
-| **Target** | Spread compresses by 60% of entry width | Take profit — close both legs |
-| **Stop-loss** | Spread widens by 50% beyond entry width | Cut losses — close both legs |
+| **Target** | Divergence narrows to 40% of entry width (60% compression) | Take profit — close both legs |
+| **Stop-loss** | Divergence widens to 150% of entry width | Cut losses — close both legs |
 | **Time stop** | BTC window has < 180s remaining | Force exit — close both legs regardless of P&L |
 
 These thresholds are configurable in the `PositionManager` constructor.
 
 ## Live Execution Notes
 
-- Entry decisions are based on visible executable quotes only. The live scanner requires real YES and NO quotes on Polymarket and does not use midpoint fallback prices.
+- Entry decisions are based on the cross-platform YES divergence. The scanner prefers raw order book prices but falls back to the CLOB midpoint when a book is too thin, so detection is never silently blocked by sparse liquidity on one outcome.
 - A position is only opened after both venue legs are confirmed filled. Posted or resting entry orders are cancelled after the entry timeout and are not treated as open arb positions.
-- Open-position P&L and spread tracking use exitable bids for the held YES and held NO legs rather than midpoint-only divergence.
+- Open-position spread tracking uses the same divergence metric as entry (cross-platform YES gap). P&L uses exitable bids for the held legs.
 - Monitor mode now targets a fixed scan cadence. It sleeps only for the remainder of `ARB_SCAN_INTERVAL` after each loop rather than doing `scan work + full interval`.
 - Snapshot fetches are partially parallelized: Kalshi market data and the Polymarket quote pass run concurrently, but Polymarket YES/NO book reads stay single-threaded inside one client because concurrent CLOB reads proved unstable in production.
 - Polymarket quote reads now retry briefly on request exceptions before the scan gives up on that venue for the current cycle.
@@ -284,12 +284,12 @@ Fees are estimated for the full round trip: entry + exit, no resolution. The run
 | Polymarket | ~2% | Profit on each individual trade (buy low, sell higher) |
 | Kalshi | ~7% | Profit on each individual trade |
 
-The scanner calculates whether the detected spread is wide enough to cover fees on both the entry and exit trades. If you buy at 0.40 and later sell at 0.48, the fee applies to the 0.08 profit -- not the full position. If you sell at a loss, no fee on that leg.
+The scanner measures the cross-platform YES price divergence and subtracts estimated round-trip fees to determine net edge. Fees are applied to each leg's profit individually — if you buy at 0.40 and later sell at 0.48, the fee applies to the 0.08 profit, not the full position. If you sell at a loss, no fee on that leg.
 
 For BTC 15-minute monitoring, the important distinction is:
 
 - midpoint spread is useful for observing dislocations,
-- executable edge is the relevant measure for whether a trade is actually there.
+- cross-platform divergence (net of fees) is the relevant measure for whether a trade is actually there.
 
 ## API / Polling Behavior
 
@@ -308,7 +308,7 @@ This keeps the bot materially faster than earlier builds while avoiding the inst
 | Risk | Description | Mitigation |
 |---|---|---|
 | **Execution** | One leg fills, the other fails | Emergency stop + best-effort flatten of the exposed leg when partial fills are disabled |
-| **Liquidity** | Thin books cause slippage or create fake midpoint edge | Position sizing is conservative; the live scanner requires visible executable quotes |
+| **Liquidity** | Thin books cause slippage or create fake midpoint edge | Position sizing is conservative; midpoint fallback on thin books is used for detection only — entry prices use visible quotes where available |
 | **Timing** | Prices move between placing both orders | Marketable-limit orders placed near-simultaneously |
 | **Overround / underround** | Venue totals may not sum to `1.00`, especially on Polymarket | Log both sides directly; live pricing uses actual YES and NO books instead of synthetic complements |
 | **Spread widening** | Spread moves against you after entry | Stop-loss exit signal triggers at configured threshold |

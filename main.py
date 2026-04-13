@@ -576,7 +576,11 @@ async def cmd_monitor(args):
 
 
 def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
-    """Fetch current prices and update a position's spread tracking."""
+    """Fetch current prices and update a position's spread tracking.
+
+    Uses the same divergence-based metric as PositionManager.update_position:
+    current_spread = cross-platform YES divergence in the direction of the trade.
+    """
     from arb_scanner import PriceSnapshot, SpreadDirection, _kalshi_book_to_prices, estimate_round_trip_fees
 
     snap = PriceSnapshot(pair=None, timestamp=time.time())
@@ -595,7 +599,6 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
         quotes = poly.get_market_quotes(
             pos.poly_token_yes,
             pos.poly_token_no,
-            allow_midpoint_fallback=False,
         )
         snap.poly_yes_bid = quotes.get("yes_bid")
         snap.poly_yes_ask = quotes.get("yes_ask")
@@ -606,24 +609,29 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
 
     pos.last_update = time.time()
 
+    k_yes = snap.kalshi_yes_mid
+    p_yes = snap.poly_yes_mid
+    if k_yes is None:
+        k_yes = snap.kalshi_yes_bid or snap.kalshi_yes_ask
+    if p_yes is None:
+        p_yes = snap.poly_yes_bid or snap.poly_yes_ask
+
+    if k_yes is not None and p_yes is not None:
+        if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
+            pos.current_spread = k_yes - p_yes
+        else:
+            pos.current_spread = p_yes - k_yes
+
     if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
-        if snap.poly_yes_bid is not None and snap.kalshi_no_bid is not None:
+        if snap.poly_yes_bid is not None:
             pos.current_yes_bid = snap.poly_yes_bid
+        if snap.kalshi_no_bid is not None:
             pos.current_no_bid = snap.kalshi_no_bid
-            pos.current_spread = max(
-                0,
-                (pos.current_yes_bid + pos.current_no_bid)
-                - (pos.yes_entry_price + pos.no_entry_price),
-            )
     else:
-        if snap.kalshi_yes_bid is not None and snap.poly_no_bid is not None:
+        if snap.kalshi_yes_bid is not None:
             pos.current_yes_bid = snap.kalshi_yes_bid
+        if snap.poly_no_bid is not None:
             pos.current_no_bid = snap.poly_no_bid
-            pos.current_spread = max(
-                0,
-                (pos.current_yes_bid + pos.current_no_bid)
-                - (pos.yes_entry_price + pos.no_entry_price),
-            )
 
     exit_yes = pos.current_yes_bid or pos.yes_entry_price
     exit_no = pos.current_no_bid or pos.no_entry_price
