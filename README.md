@@ -168,13 +168,15 @@ All settings in `.env`:
 |---|---|---|
 | `ARB_BTC15_TIME_GATING` | `true` | Enable entry-time gating for BTC 15m windows |
 | `ARB_ENTRY_MIN_SECONDS_IN_WINDOW` | `45` | Do not enter too early in a fresh 15m window |
-| `ARB_ENTRY_MAX_SECONDS_IN_WINDOW` | `780` | Stop entering near window end (avoid stale/late trades) |
+| `ARB_ENTRY_MAX_SECONDS_IN_WINDOW` | `600` | Stop entering near window end (ensures minimum 5 min holding time) |
 | `ARB_ENTRY_COOLDOWN_SECONDS_AFTER_ROLLOVER` | `20` | Cooldown right after rollover before new entries |
-| `ARB_FORCE_EXIT_SECONDS_REMAINING` | `180` | Force BTC exits when the window is too close to expiry |
+| `ARB_FORCE_EXIT_SECONDS_REMAINING` | `120` | Force BTC exits when the window is too close to expiry. Also blocks new entries when remaining time is at or below this threshold |
 | `ARB_MIN_EDGE_PERSIST_SCANS` | `2` | Edge must persist for N scans before entering |
 | `ARB_MAX_POLY_OVERROUND` | `0.04` | Reject entries when the live Polymarket YES+NO total is too distorted |
 | `ARB_MIN_KALSHI_LEVEL_QTY` | `10` | Require minimum size at the Kalshi level used for entry |
 | `ARB_MAX_SIGNAL_AGE_SECONDS` | `8` | Reject stale signals between detection and order submit |
+| `ARB_EXIT_TARGET_PCT` | `0.60` | Exit when divergence compresses by this fraction (0.60 = 60% compression) |
+| `ARB_STOP_LOSS_PCT` | `1.00` | Exit when divergence widens by this fraction beyond entry (1.00 = doubles from entry) |
 
 ### Execution controls
 
@@ -208,11 +210,15 @@ The position manager tracks the live cross-platform YES divergence for each open
 
 | Signal | Trigger | Action |
 |---|---|---|
-| **Target** | Divergence narrows to 40% of entry width (60% compression) | Take profit — close both legs |
-| **Stop-loss** | Divergence widens to 150% of entry width | Cut losses — close both legs |
-| **Time stop** | BTC window has < 180s remaining | Force exit — close both legs regardless of P&L |
+| **Target** | Divergence narrows to 40% of entry width (60% compression) **and** unrealized P&L >= $0 | Take profit — close both legs |
+| **Stop-loss** | Divergence widens to 200% of entry width (or trailing stop level) | Cut losses — close both legs |
+| **Time stop** | BTC window has < 120s remaining | Force exit — close both legs regardless of P&L |
 
-These thresholds are configurable in the `PositionManager` constructor.
+The target exit includes a P&L floor: it will not fire if the actual unrealized P&L is negative, even when the divergence metric has compressed past the threshold. This prevents locking in a loss to bid-ask friction on a "profitable" divergence move. The time stop and stop-loss fire unconditionally.
+
+A **trailing stop** ratchets the stop-loss tighter as the position moves in your favor. Once the divergence has compressed 40% from entry, the stop-loss moves to breakeven (entry spread). At 60% compression, it tightens to 70% of entry spread. The stop never moves back — it only gets tighter.
+
+Exit target and stop-loss thresholds are configurable via `ARB_EXIT_TARGET_PCT` and `ARB_STOP_LOSS_PCT` environment variables.
 
 ## Live Execution Notes
 
@@ -227,8 +233,8 @@ These thresholds are configurable in the `PositionManager` constructor.
 
 When an exit is triggered, the executor follows an escalation sequence:
 
-1. **Marketable limit** — price the sell to cross the spread (when `ARB_EXIT_LIMIT_ONLY=false`)
-2. **Reprice** — cancel and resubmit at progressively more aggressive prices (`ARB_EXIT_REPRICE_ATTEMPTS` rounds)
+1. **At bid** — first attempt prices the sell at the current bid (when `ARB_EXIT_LIMIT_ONLY=false`)
+2. **Reprice** — cancel and resubmit at progressively more aggressive prices (bid minus 1¢ per retry, `ARB_EXIT_REPRICE_ATTEMPTS` rounds)
 3. **Final dump** — submit at $0.01 on Polymarket / 1¢ on Kalshi to guarantee a fill
 
 On Polymarket specifically, sells go through a progressive size reduction (95% → 93% → 90% → 85% of held shares) because the CLOB's server-side balance cache doesn't update instantly after a buy fills. A conditional allowance refresh is called before each sell attempt.

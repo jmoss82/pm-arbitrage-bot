@@ -531,10 +531,10 @@ class ArbExecutor:
         if self.exit_limit_only:
             base = bid if bid is not None else (ask if ask is not None else 0.01)
             return max(0.01, min(0.99, base + self.poly_exit_passive))
-        # Aggressive: price off the bid and subtract aggression to cross the
-        # spread, mirroring how entries price off the ask.
+        # Start at the bid on the first attempt; the escalation loop in
+        # _exit_poly_with_escalation subtracts attempt*0.01 on retries.
         base = bid if bid is not None else (ask if ask is not None else 0.01)
-        return max(0.01, min(0.99, base - self.poly_entry_aggr))
+        return max(0.01, min(0.99, base))
 
     def _exit_kalshi_limit_prices(self, ticker: str, kalshi_side: str) -> tuple[int | None, int | None]:
         yes_price = None
@@ -545,7 +545,8 @@ class ArbExecutor:
             if self.exit_limit_only:
                 offset = self.kalshi_exit_passive_c
             else:
-                offset = -self.kalshi_entry_aggr_c
+                # Start at bid; escalation loop handles below-bid repricing
+                offset = 0
             if kalshi_side == "yes":
                 bid_ref = prices.get("yes_bid")
                 if bid_ref is not None:
@@ -646,13 +647,16 @@ class ArbExecutor:
         for attempt in range(attempts + 1):
             yes_price, no_price = self._exit_kalshi_limit_prices(ticker, side)
             if attempt == attempts:
-                # Final attempt: sell at 1c — guaranteed fill if any buyer
-                # exists.  Getting flat matters more than price on expiring
-                # contracts.
                 if side == "yes":
                     yes_price, no_price = 1, None
                 else:
                     yes_price, no_price = None, 1
+            elif attempt > 0:
+                # Escalate: reduce price by 1c per retry attempt
+                if side == "yes" and yes_price is not None:
+                    yes_price = max(1, yes_price - attempt)
+                elif side == "no" and no_price is not None:
+                    no_price = max(1, no_price - attempt)
             order = self.kalshi.create_order(
                 ticker=ticker,
                 side=side,

@@ -54,6 +54,7 @@ class ArbPosition:
 
     # Live tracking (updated each scan)
     current_spread: float = 0.0
+    best_spread: float = 0.0         # lowest (most compressed) spread seen
     current_yes_bid: float = 0.0
     current_no_bid: float = 0.0
     unrealized_pnl: float = 0.0
@@ -90,13 +91,14 @@ class PositionManager:
 
     def __init__(
         self,
-        exit_target_pct: float = 0.60,
-        stop_loss_pct: float = 0.50,
+        exit_target_pct: float | None = None,
+        stop_loss_pct: float | None = None,
     ):
+        import config as _cfg
         self.positions: dict[str, ArbPosition] = {}
         self.closed_positions: list[ArbPosition] = []
-        self.exit_target_pct = exit_target_pct  # close when spread compresses 60%
-        self.stop_loss_pct = stop_loss_pct      # cut when spread widens 50% beyond entry
+        self.exit_target_pct = exit_target_pct if exit_target_pct is not None else _cfg.ARB_EXIT_TARGET_PCT
+        self.stop_loss_pct = stop_loss_pct if stop_loss_pct is not None else _cfg.ARB_STOP_LOSS_PCT
         self._load()
 
     # -- Position creation -----------------------------------------------------
@@ -129,6 +131,7 @@ class PositionManager:
             poly_token_no=opp.pair.poly.token_no,
             poly_condition_id=opp.pair.poly.condition_id,
             current_spread=opp.spread_width,
+            best_spread=opp.spread_width,
             target_exit_spread=target,
             stop_loss_spread=stop,
             status="open",
@@ -172,6 +175,16 @@ class PositionManager:
             else:
                 pos.current_spread = p_yes - k_yes
 
+        # Trailing stop: ratchet stop-loss tighter as spread compresses
+        pos.best_spread = min(pos.best_spread, pos.current_spread)
+        if pos.entry_spread > 0:
+            compression = 1 - (pos.best_spread / pos.entry_spread)
+            if compression >= 0.60:
+                new_stop = pos.entry_spread * 0.70
+                pos.stop_loss_spread = min(pos.stop_loss_spread, new_stop)
+            elif compression >= 0.40:
+                pos.stop_loss_spread = min(pos.stop_loss_spread, pos.entry_spread)
+
         # Track exitable bids for P&L computation
         if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
             if snapshot.poly_yes_bid is not None:
@@ -204,11 +217,14 @@ class PositionManager:
             if pos.status != "open":
                 continue
 
-            # Target hit: spread compressed enough
-            if pos.current_spread <= pos.target_exit_spread:
+            # Target hit: spread compressed enough AND P&L is non-negative.
+            # The P&L gate prevents exiting "profitably" by divergence while
+            # actually losing money to bid-ask friction.  Time-stop and
+            # stop-loss still fire unconditionally.
+            if pos.current_spread <= pos.target_exit_spread and pos.unrealized_pnl >= 0:
                 signals.append((pos, "target"))
-                logger.info("EXIT SIGNAL [target]: %s spread %.4f <= target %.4f",
-                            pos.pair_label, pos.current_spread, pos.target_exit_spread)
+                logger.info("EXIT SIGNAL [target]: %s spread %.4f <= target %.4f (pnl $%.2f)",
+                            pos.pair_label, pos.current_spread, pos.target_exit_spread, pos.unrealized_pnl)
 
             # Stop loss: spread widened against us
             elif pos.current_spread >= pos.stop_loss_spread:

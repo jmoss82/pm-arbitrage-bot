@@ -625,6 +625,16 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
         else:
             pos.current_spread = p_yes - k_yes
 
+    # Trailing stop: ratchet stop-loss tighter as spread compresses
+    pos.best_spread = min(pos.best_spread, pos.current_spread)
+    if pos.entry_spread > 0:
+        compression = 1 - (pos.best_spread / pos.entry_spread)
+        if compression >= 0.60:
+            new_stop = pos.entry_spread * 0.70
+            pos.stop_loss_spread = min(pos.stop_loss_spread, new_stop)
+        elif compression >= 0.40:
+            pos.stop_loss_spread = min(pos.stop_loss_spread, pos.entry_spread)
+
     if pos.direction == SpreadDirection.KALSHI_HIGHER.value:
         if snap.poly_yes_bid is not None:
             pos.current_yes_bid = snap.poly_yes_bid
