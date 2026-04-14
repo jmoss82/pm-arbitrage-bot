@@ -460,6 +460,30 @@ class PolymarketClient:
         balance, _ = self.get_usdc_balance_details()
         return balance
 
+    def get_conditional_token_balance(self, token_id: str) -> float | None:
+        """Return available conditional-token balance in shares for a token."""
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            )
+            bal = self.clob.get_balance_allowance(params)
+            if not isinstance(bal, dict):
+                return None
+
+            raw_balance = bal.get("balance")
+            raw_allowance = bal.get("allowance")
+
+            balance = float(raw_balance) / 1e6 if raw_balance is not None else None
+            allowance = float(raw_allowance) / 1e6 if raw_allowance is not None else None
+
+            if balance is not None and allowance is not None:
+                return min(balance, allowance)
+            return balance if balance is not None else allowance
+        except Exception as e:
+            logger.debug("Failed to get conditional balance for %s: %s", token_id[:12], e)
+            return None
+
     @staticmethod
     async def fetch_positions(session: aiohttp.ClientSession, wallet: str) -> list[dict]:
         """Fetch current positions from the Data API."""

@@ -142,6 +142,26 @@ def _btc_diag_line(snap, opp) -> str:
     return " | ".join(parts)
 
 
+def _describe_entry_rejection(opp, pos_mgr, executor, streak_count: int | None = None) -> str | None:
+    if opp is None:
+        return None
+    timing_ok, timing_reason = _entry_timing_allowed(opp.pair.label)
+    if not timing_ok:
+        return timing_reason
+    quality_ok, quality_reason = _opportunity_passes_quality_filters(opp)
+    if not quality_ok:
+        return quality_reason
+    if pos_mgr.has_open_position(opp.pair.kalshi_ticker, opp.direction.value):
+        return "matching-position-open"
+    if executor is not None:
+        cooldown_reason = executor.entry_block_reason(opp.pair.kalshi_ticker, opp.direction.value)
+        if cooldown_reason:
+            return cooldown_reason
+    if streak_count is not None and streak_count < config.ARB_MIN_EDGE_PERSIST_SCANS:
+        return f"edge-not-persistent({streak_count}/{config.ARB_MIN_EDGE_PERSIST_SCANS})"
+    return None
+
+
 def _position_status_line(pos) -> str:
     return (
         f"{pos.pair_label} | dir {pos.direction} | spread {pos.current_spread:.3f} "
@@ -413,6 +433,7 @@ async def cmd_monitor(args):
             loop_started = time.perf_counter()
             scan_count += 1
             ts = time.strftime("%H:%M:%S")
+            btc_reject_reason = None
 
             # 1. Check open positions for exit signals
             if pos_mgr.positions:
@@ -471,6 +492,14 @@ async def cmd_monitor(args):
                     snap = fetch_snapshot(btc_pair, kalshi, poly)
                     single = detect_spread(snap)
                     opps = [single] if (single and single.net_edge >= config.ARB_MIN_EDGE) else []
+                    if single:
+                        key = f"{single.pair.kalshi_ticker}:{single.direction.value}"
+                        streak = entry_streaks.get(key, 0)
+                        if single.net_edge >= config.ARB_MIN_EDGE:
+                            streak += 1
+                        else:
+                            streak = None
+                        btc_reject_reason = _describe_entry_rejection(single, pos_mgr, executor, streak)
                 else:
                     opps = []
             elif tradeable:
@@ -553,6 +582,8 @@ async def cmd_monitor(args):
                           f"({pair_count} pair, {open_count} open positions)")
                     if config.ARB_BTC15_ONLY and btc_pair:
                         print(f"      {_btc_diag_line(snap, single)}")
+                        if btc_reject_reason:
+                            print(f"      skipped: {btc_reject_reason}")
             elif scan_count % 12 == 1:
                 open_count = len(pos_mgr.positions)
                 pair_count = 1 if config.ARB_BTC15_ONLY else len(tradeable)
@@ -560,6 +591,8 @@ async def cmd_monitor(args):
                       f"({pair_count} pair, {open_count} open positions)")
                 if config.ARB_BTC15_ONLY and btc_pair:
                     print(f"      {_btc_diag_line(snap, single)}")
+                    if btc_reject_reason:
+                        print(f"      skipped: {btc_reject_reason}")
 
             # Refresh markets every 50 scans (non-BTC-only mode)
             if (not config.ARB_BTC15_ONLY) and scan_count % 50 == 0:

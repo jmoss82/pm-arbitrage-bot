@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 # residual dust settles automatically at market resolution.
 # See: https://github.com/Polymarket/py-clob-client/issues/287
 _POLY_SELL_SIZE_FACTOR = config.ARB_POLY_SELL_SIZE_FACTOR
-_POLY_MIN_ORDER_SIZE = 5  # Polymarket rejects orders smaller than this
+_POLY_MIN_ORDER_SIZE = 0.001
+_POLY_DUST_TOLERANCE = 0.25
 
 
 def _poly_sell_size(contracts: int) -> float:
@@ -44,6 +45,10 @@ def _poly_sell_size(contracts: int) -> float:
     truncated to 3 decimal places (floor) to avoid floating-point dust."""
     raw = contracts * _POLY_SELL_SIZE_FACTOR
     return math.floor(raw * 1000) / 1000
+
+
+def _floor_thousandths(size: float) -> float:
+    return math.floor(size * 1000) / 1000
 
 
 @dataclass
@@ -134,6 +139,46 @@ class ArbExecutor:
         self.emergency_stop = False
         self.emergency_reason: str | None = None
         self._stop_loss_cooldowns: dict[str, float] = {}
+
+    def _poly_available_exit_size(self, token_id: str, contracts: int) -> float:
+        self.poly.refresh_conditional_allowance(token_id)
+        available = self.poly.get_conditional_token_balance(token_id)
+        nominal = float(contracts)
+        if available is None:
+            return nominal
+
+        clipped = max(0.0, min(nominal, available))
+        if nominal - clipped > _POLY_DUST_TOLERANCE:
+            logger.warning(
+                "Poly available balance materially below nominal size: token=%s nominal=%.3f available=%.3f",
+                token_id,
+                nominal,
+                clipped,
+            )
+        elif clipped < nominal:
+            logger.info(
+                "Poly available balance below nominal size, using available shares: token=%s nominal=%.3f available=%.3f",
+                token_id,
+                nominal,
+                clipped,
+            )
+        return _floor_thousandths(clipped)
+
+    def _poly_sell_sizes(self, max_size: float) -> list[float]:
+        if max_size <= 0:
+            return []
+
+        size_factors = [1.0, _POLY_SELL_SIZE_FACTOR, 0.98, 0.95, 0.93, 0.90, 0.85]
+        sell_sizes: list[float] = []
+        for sf in size_factors:
+            sz = _floor_thousandths(max_size * sf)
+            if sz >= _POLY_MIN_ORDER_SIZE and sz not in sell_sizes:
+                sell_sizes.append(sz)
+
+        exact = _floor_thousandths(max_size)
+        if exact >= _POLY_MIN_ORDER_SIZE and exact not in sell_sizes:
+            sell_sizes.insert(0, exact)
+        return sell_sizes
 
     def entry_block_reason(self, kalshi_ticker: str, direction: str) -> str | None:
         cooldown_key = f"{kalshi_ticker}:{direction}"
@@ -703,19 +748,15 @@ class ArbExecutor:
             "partial": False,
         }
 
-        self.poly.refresh_conditional_allowance(token_id)
-
-        # Build candidate sell sizes.  Start with 100%, then progressively
-        # smaller sizes to work around the CLOB balance cache bug.
-        # Skip any reduced size that falls below _POLY_MIN_ORDER_SIZE.
-        size_factors = [1.0, _POLY_SELL_SIZE_FACTOR, 0.93, 0.90, 0.85]
-        sell_sizes: list[float] = []
-        for sf in size_factors:
-            sz = math.floor(contracts * sf * 1000) / 1000
-            if sz >= _POLY_MIN_ORDER_SIZE:
-                sell_sizes.append(sz)
+        available_size = self._poly_available_exit_size(token_id, contracts)
+        sell_sizes = self._poly_sell_sizes(available_size)
         if not sell_sizes:
-            sell_sizes = [float(contracts)]
+            return False, {
+                "error": "no conditional token balance available to exit",
+                "status": "failed",
+                "order_id": None,
+                "partial": False,
+            }
 
         full_size_retries = 0
         idx = 0
@@ -815,14 +856,18 @@ class ArbExecutor:
                 if partial:
                     return False, last_meta
 
-            if balance_error and sell_size == float(contracts) and full_size_retries < 3:
+            if balance_error and full_size_retries < 3:
                 # Full-size sell failed.  If reduced sizes would be below the
                 # platform minimum, retrying at full size with an allowance
                 # refresh and a delay is our only option.
                 full_size_retries += 1
-                logger.info("Refreshing Poly allowance and retrying full size (%d/3)", full_size_retries)
+                logger.info("Refreshing Poly balance/allowance and retrying exit sizing (%d/3)", full_size_retries)
                 time.sleep(1.5)
-                self.poly.refresh_conditional_allowance(token_id)
+                refreshed_size = self._poly_available_exit_size(token_id, contracts)
+                refreshed_sell_sizes = self._poly_sell_sizes(refreshed_size)
+                if refreshed_sell_sizes:
+                    sell_sizes = refreshed_sell_sizes
+                    idx = 0
                 # Don't advance idx — retry the same full size
                 continue
 
@@ -1090,17 +1135,12 @@ class ArbExecutor:
         self._trip_emergency_stop(f"partial exit on {pos.pair_label}")
 
     def _emergency_flatten_poly(self, token_id: str, contracts: int):
-        self.poly.refresh_conditional_allowance(token_id)
-        # Build candidate sizes: full first, then progressively smaller.
-        # Skip any size below the platform minimum.
-        factors = [1.0, 0.95, 0.90, 0.85, 0.80]
-        sell_sizes = []
-        for f in factors:
-            sz = math.floor(contracts * f * 1000) / 1000
-            if sz >= _POLY_MIN_ORDER_SIZE:
-                sell_sizes.append(sz)
+        available_size = self._poly_available_exit_size(token_id, contracts)
+        sell_sizes = self._poly_sell_sizes(available_size)
         if not sell_sizes:
-            sell_sizes = [float(contracts)]
+            logger.error("Emergency Poly flatten aborted: no conditional token balance available")
+            print("      Emergency Poly flatten aborted: no conditional token balance available")
+            return
 
         full_retries = 0
         idx = 0
@@ -1114,12 +1154,15 @@ class ArbExecutor:
             except Exception as e:
                 err_str = str(e)
                 logger.warning("Emergency Poly flatten at %s shares failed: %s", sell_size, e)
-                if ("not enough balance" in err_str or "minimum" in err_str.lower()) \
-                        and sell_size == float(contracts) and full_retries < 3:
+                if ("not enough balance" in err_str or "minimum" in err_str.lower()) and full_retries < 3:
                     full_retries += 1
-                    logger.info("Emergency flatten: refreshing allowance and retrying full size (%d/3)", full_retries)
+                    logger.info("Emergency flatten: refreshing balance/allowance and retrying sizing (%d/3)", full_retries)
                     time.sleep(1.5)
-                    self.poly.refresh_conditional_allowance(token_id)
+                    refreshed_size = self._poly_available_exit_size(token_id, contracts)
+                    refreshed_sell_sizes = self._poly_sell_sizes(refreshed_size)
+                    if refreshed_sell_sizes:
+                        sell_sizes = refreshed_sell_sizes
+                        idx = 0
                     continue
             idx += 1
         logger.error("Emergency Poly flatten exhausted all size attempts")
