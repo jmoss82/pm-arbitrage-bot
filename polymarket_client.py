@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 
 import aiohttp
+import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
@@ -84,6 +85,7 @@ class PolymarketClient:
 
     def __init__(self, derive_keys: bool = True):
         self.clob = self._init_clob(derive_keys)
+        self._fee_rate_cache_bps: dict[str, int] = {}
 
     def _init_clob(self, derive_keys: bool) -> ClobClient:
         explicit_creds_available = all(
@@ -318,6 +320,47 @@ class PolymarketClient:
         }
 
     # ── Order Execution (CLOB — sync) ────────────────────────────────────
+
+    def get_fee_rate_bps(self, token_id: str) -> int:
+        """Return the token's taker fee rate in basis points."""
+        cached = self._fee_rate_cache_bps.get(token_id)
+        if cached is not None:
+            return cached
+
+        raw = None
+        try:
+            if hasattr(self.clob, "get_fee_rate_bps"):
+                raw = self.clob.get_fee_rate_bps(token_id)
+            elif hasattr(self.clob, "get_fee_rate"):
+                raw = self.clob.get_fee_rate(token_id)
+        except Exception as e:
+            logger.debug("SDK fee lookup failed for %s: %s", token_id[:12], e)
+
+        if raw is None:
+            resp = requests.get(
+                f"{config.CLOB_HOST}/fee-rate",
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+        if isinstance(raw, dict):
+            value = (
+                raw.get("fee_rate_bps")
+                or raw.get("feeRateBps")
+                or raw.get("fee_rate")
+                or raw.get("feeRate")
+            )
+        else:
+            value = raw
+
+        bps = int(round(float(value)))
+        self._fee_rate_cache_bps[token_id] = bps
+        return bps
+
+    def get_fee_rate(self, token_id: str) -> float:
+        return self.get_fee_rate_bps(token_id) / 10_000.0
 
     def buy(self, token_id: str, price: float, size: float) -> dict:
         return self.clob.create_and_post_order(

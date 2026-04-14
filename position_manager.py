@@ -17,7 +17,7 @@ from pathlib import Path
 
 from arb_scanner import (
     PriceSnapshot, SpreadDirection, SpreadOpportunity,
-    fetch_snapshot, estimate_round_trip_fees,
+    fetch_snapshot, estimate_entry_fees, estimate_exit_fees,
 )
 from market_matcher import MarketPair
 from trade_logger import log_lifecycle_row
@@ -51,6 +51,7 @@ class ArbPosition:
     poly_token_yes: str = ""
     poly_token_no: str = ""
     poly_condition_id: str = ""
+    poly_fee_rate: float = 0.0
 
     # Live tracking (updated each scan)
     current_spread: float = 0.0
@@ -130,6 +131,7 @@ class PositionManager:
             poly_token_yes=opp.pair.poly.token_yes,
             poly_token_no=opp.pair.poly.token_no,
             poly_condition_id=opp.pair.poly.condition_id,
+            poly_fee_rate=opp.poly_fee_rate,
             current_spread=opp.spread_width,
             best_spread=opp.spread_width,
             target_exit_spread=target,
@@ -200,11 +202,12 @@ class PositionManager:
         exit_yes = pos.current_yes_bid or pos.yes_entry_price
         exit_no = pos.current_no_bid or pos.no_entry_price
         exit_proceeds = (exit_yes + exit_no) * pos.contracts
-        fees = estimate_round_trip_fees(
-            pos.yes_entry_price, pos.no_entry_price,
+        fees = estimate_exit_fees(
             exit_yes, exit_no,
             pos.yes_platform,
-        ) * pos.contracts
+            pos.poly_fee_rate,
+            contracts=pos.contracts,
+        )
         pos.unrealized_pnl = exit_proceeds - pos.entry_cost - fees
 
     def check_exit_signals(self) -> list[tuple[ArbPosition, str]]:

@@ -55,7 +55,7 @@ What's built:
 - [x] **Kalshi Python client** - Full REST API with RSA-PSS request signing
 - [x] **Polymarket client** - CLOB order execution + Gamma API market discovery, runtime key derivation
 - [x] **Cross-platform market matcher** - Event-level fuzzy matching with entity extraction
-- [x] **Spread scanner** - Detects cross-platform YES price divergences and estimates round-trip fees; uses midpoint fallback on thin books to avoid silent detection gaps
+- [x] **Spread scanner** - Detects cross-platform YES price divergences and estimates round-trip fees with venue-aware fee logic; uses midpoint fallback on thin books to avoid silent detection gaps
 - [x] **Position manager** - Tracks open arb positions, monitors spread compression, generates exit signals (target hit, stop-loss, or time stop)
 - [x] **Arb executor** - Handles entry and exit on both platforms with marketable-limit orders, entry fill verification, escalating exit logic, and emergency flatten
 - [x] **REST latency tuning** - Kalshi and Polymarket snapshot fetches run in parallel, the monitor loop targets a fixed scan cadence, and live Polymarket quotes skip midpoint lookups
@@ -152,7 +152,7 @@ All settings in `.env`:
 |---|---|---|
 | `ARB_SCAN_INTERVAL` | `5` | Seconds between scans in monitor mode |
 | `ARB_BTC15_ONLY` | `true` | Restrict monitor/scan/execute to the current BTC 15-minute market pair only |
-| `ARB_MIN_EDGE` | `0.05` | Minimum net edge (divergence minus fees) to enter |
+| `ARB_MIN_EDGE` | `0.05` | Minimum net edge to enter after modeled venue fees and the fixed slippage buffer |
 | `ARB_MAX_POSITION_USD` | `50.0` | Max USD per position (both legs combined) |
 | `ARB_MAX_DAILY_SPEND` | `500.0` | Daily spend cap across all entries |
 | `ARB_DRY_RUN` | `true` | Paper trading mode. Keep `true` during calibration |
@@ -286,17 +286,21 @@ Use these for dry-run acceptance gates before enabling live mode.
 
 Fees are estimated for the full round trip: entry + exit, no resolution. The runtime estimate also includes a configurable fixed slippage/fill-risk buffer via `ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE`.
 
-| Platform | Fee Rate | Applied to |
+| Platform | Runtime Model | Notes |
 |---|---|---|
-| Polymarket | ~2% | Profit on each individual trade (buy low, sell higher) |
-| Kalshi | ~7% | Profit on each individual trade |
+| Polymarket | Live taker fee rate fetched per token from the CLOB fee-rate endpoint | Used for both scan-time edge estimation and realized/unrealized P&L |
+| Kalshi | Taker fee schedule modeled as `0.07 * contracts * price * (1 - price)`, rounded up to the nearest cent | Applied separately on entry and exit |
 
 The scanner measures the cross-platform YES price divergence and subtracts estimated round-trip fees to determine net edge. Fees are applied to each leg's profit individually — if you buy at 0.40 and later sell at 0.48, the fee applies to the 0.08 profit, not the full position. If you sell at a loss, no fee on that leg.
+
+The current runtime no longer uses the old profit-only approximation for live decisions. It models venue fees directly, and `ARB_MIN_EDGE` is evaluated against that fee-adjusted net edge rather than the raw divergence.
 
 For BTC 15-minute monitoring, the important distinction is:
 
 - midpoint spread is useful for observing dislocations,
 - cross-platform divergence (net of fees) is the relevant measure for whether a trade is actually there.
+
+Open-position P&L uses the same fee-aware accounting. Entry cost is stored inclusive of entry fees, and unrealized/realized P&L subtract only the modeled exit fees still remaining or actually incurred.
 
 ## API / Polling Behavior
 
@@ -319,7 +323,7 @@ This keeps the bot materially faster than earlier builds while avoiding the inst
 | **Timing** | Prices move between placing both orders | Marketable-limit orders placed near-simultaneously |
 | **Overround / underround** | Venue totals may not sum to `1.00`, especially on Polymarket | Log both sides directly; live pricing uses actual YES and NO books instead of synthetic complements |
 | **Spread widening** | Spread moves against you after entry | Stop-loss exit signal triggers at configured threshold |
-| **Fee changes** | Platform fee structures can change | Fee rates are configurable constants |
+| **Fee changes** | Platform fee structures can change | Polymarket fee rates are fetched live per token; Kalshi uses the published taker-fee formula; keep the bot updated when venue docs change |
 | **Matching** | False positive on different events | Manual pair verification before live; entity-aware scoring |
 | **Polymarket balance cache** | CLOB's server-side balance doesn't update instantly after buys fill, causing sell failures | Conditional allowance refresh + progressive sell-size reduction (95% → 85%) + post-exit cooldown |
 | **Token settlement locking** | Polymarket tokens stay locked in matched orders until on-chain settlement completes | 60s post-exit cooldown blocks re-entry; prevents double-spending locked tokens |

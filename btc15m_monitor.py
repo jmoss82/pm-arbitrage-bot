@@ -194,7 +194,13 @@ def _compute_executable_edge(k_yes_bid, k_yes_ask, p_yes_bid, p_yes_ask):
 
     if p_yes_ask is not None and k_yes_bid is not None and k_yes_bid > p_yes_ask:
         gross = k_yes_bid - p_yes_ask
-        fees = estimate_entry_exit_fees_simple(gross, "polymarket")
+        fees = estimate_entry_exit_fees_simple(
+            p_yes_ask,
+            1.0 - k_yes_bid,
+            "polymarket",
+            0.0,
+            exit_yes_price=(k_yes_bid + p_yes_ask) / 2,
+        )
         best = {
             "direction": "poly_up / kalshi_down",
             "gross_edge": gross,
@@ -205,7 +211,13 @@ def _compute_executable_edge(k_yes_bid, k_yes_ask, p_yes_bid, p_yes_ask):
 
     if k_yes_ask is not None and p_yes_bid is not None and p_yes_bid > k_yes_ask:
         gross = p_yes_bid - k_yes_ask
-        fees = estimate_entry_exit_fees_simple(gross, "kalshi")
+        fees = estimate_entry_exit_fees_simple(
+            k_yes_ask,
+            1.0 - p_yes_bid,
+            "kalshi",
+            0.0,
+            exit_yes_price=(k_yes_ask + p_yes_bid) / 2,
+        )
         candidate = {
             "direction": "kalshi_up / poly_down",
             "gross_edge": gross,

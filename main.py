@@ -584,7 +584,7 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
     Uses the same divergence-based metric as PositionManager.update_position:
     current_spread = cross-platform YES divergence in the direction of the trade.
     """
-    from arb_scanner import PriceSnapshot, SpreadDirection, _kalshi_book_to_prices, estimate_round_trip_fees
+    from arb_scanner import PriceSnapshot, SpreadDirection, _kalshi_book_to_prices, estimate_exit_fees
 
     snap = PriceSnapshot(pair=None, timestamp=time.time())
 
@@ -649,12 +649,40 @@ def _update_position_prices(pos, kalshi: KalshiClient, poly: PolymarketClient):
     exit_yes = pos.current_yes_bid or pos.yes_entry_price
     exit_no = pos.current_no_bid or pos.no_entry_price
     exit_proceeds = (exit_yes + exit_no) * pos.contracts
-    fees = estimate_round_trip_fees(
-        pos.yes_entry_price, pos.no_entry_price,
+    fees = estimate_exit_fees(
         exit_yes, exit_no,
         pos.yes_platform,
-    ) * pos.contracts
+        pos.poly_fee_rate,
+        contracts=pos.contracts,
+    )
     pos.unrealized_pnl = exit_proceeds - pos.entry_cost - fees
+
+
+async def _edge_persists_for_execute(
+    seed_opp,
+    kalshi: KalshiClient,
+    poly: PolymarketClient,
+) -> tuple[bool, object | None, str]:
+    required = max(1, config.ARB_MIN_EDGE_PERSIST_SCANS)
+    latest = seed_opp
+
+    if required <= 1:
+        return True, latest, "persistence-disabled"
+
+    for scan_idx in range(2, required + 1):
+        await asyncio.sleep(config.ARB_SCAN_INTERVAL)
+        snap = fetch_snapshot(seed_opp.pair, kalshi, poly)
+        latest = detect_spread(snap)
+        if latest is None:
+            return False, None, f"edge-disappeared({scan_idx}/{required})"
+        if latest.direction != seed_opp.direction:
+            return False, latest, f"direction-changed({scan_idx}/{required})"
+        if latest.pair.kalshi_ticker != seed_opp.pair.kalshi_ticker:
+            return False, latest, f"market-changed({scan_idx}/{required})"
+        if latest.net_edge < config.ARB_MIN_EDGE:
+            return False, latest, f"edge-below-threshold({scan_idx}/{required})"
+
+    return True, latest, f"edge-persisted({required}/{required})"
 
 
 # -- Mode: execute -------------------------------------------------------------
@@ -696,6 +724,21 @@ async def cmd_execute(args):
     executor = ArbExecutor(kalshi, poly, pos_mgr)
     _preflight_or_raise(executor, "execute")
     for opp in opps:
+        persisted, opp_for_entry, persist_reason = await _edge_persists_for_execute(opp, kalshi, poly)
+        if not persisted:
+            print(f"\n  Skipping {opp.pair.label}: {persist_reason}")
+            log_signal({
+                "pair": opp.pair.label,
+                "ticker": opp.pair.kalshi_ticker,
+                "direction": opp.direction.value,
+                "spread_width": round(opp.spread_width, 6),
+                "net_edge": round(opp.net_edge, 6),
+                "accepted": False,
+                "reason": persist_reason,
+            })
+            continue
+
+        opp = opp_for_entry
         timing_ok, timing_reason = _entry_timing_allowed(opp.pair.label)
         quality_ok, quality_reason = _opportunity_passes_quality_filters(opp)
         cooldown_reason = executor.entry_block_reason(opp.pair.kalshi_ticker, opp.direction.value)
@@ -720,7 +763,7 @@ async def cmd_execute(args):
             "spread_width": round(opp.spread_width, 6),
             "net_edge": round(opp.net_edge, 6),
             "accepted": True,
-            "reason": "passed-filters",
+            "reason": persist_reason,
         })
         print_opportunities([opp])
         result = executor.enter(opp)

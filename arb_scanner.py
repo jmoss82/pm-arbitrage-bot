@@ -14,9 +14,11 @@ Round-trip cost model:
   The spread needs to compress by more than the total round-trip friction.
 """
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from enum import Enum
 
 import config
@@ -56,6 +58,8 @@ class PriceSnapshot:
     poly_yes_ask: float | None = None
     poly_no_bid: float | None = None
     poly_no_ask: float | None = None
+    poly_yes_fee_rate: float | None = None
+    poly_no_fee_rate: float | None = None
 
     @property
     def kalshi_yes_mid(self) -> float | None:
@@ -103,6 +107,7 @@ class SpreadOpportunity:
     poly_total: float | None = None
     kalshi_total: float | None = None
     kalshi_leg_available_qty: int | None = None
+    poly_fee_rate: float = 0.0
 
     def __repr__(self):
         return (
@@ -113,8 +118,63 @@ class SpreadOpportunity:
 
 # -- Fee model for round-trip trades ------------------------------------------
 
-POLY_FEE_RATE = 0.02
-KALSHI_FEE_RATE = 0.07
+KALSHI_TAKER_FEE_RATE = 0.07
+
+
+def _clamp_price(price: float) -> float:
+    return max(0.0001, min(0.9999, price))
+
+
+def _round_poly_fee(value: float) -> float:
+    return float(Decimal(str(value)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
+
+
+def _round_kalshi_fee(value: float) -> float:
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_CEILING))
+
+
+def polymarket_order_fee(price: float, contracts: int, fee_rate: float) -> float:
+    price = _clamp_price(price)
+    raw = contracts * fee_rate * price * (1.0 - price)
+    return _round_poly_fee(raw)
+
+
+def kalshi_order_fee(price: float, contracts: int) -> float:
+    price = _clamp_price(price)
+    raw = KALSHI_TAKER_FEE_RATE * contracts * price * (1.0 - price)
+    return _round_kalshi_fee(raw)
+
+
+def estimate_entry_fees(
+    entry_yes_price: float,
+    entry_no_price: float,
+    yes_platform: str,
+    poly_fee_rate: float,
+    contracts: int = 1,
+) -> float:
+    if yes_platform == "polymarket":
+        yes_fee = polymarket_order_fee(entry_yes_price, contracts, poly_fee_rate)
+        no_fee = kalshi_order_fee(entry_no_price, contracts)
+    else:
+        yes_fee = kalshi_order_fee(entry_yes_price, contracts)
+        no_fee = polymarket_order_fee(entry_no_price, contracts, poly_fee_rate)
+    return yes_fee + no_fee
+
+
+def estimate_exit_fees(
+    exit_yes_price: float,
+    exit_no_price: float,
+    yes_platform: str,
+    poly_fee_rate: float,
+    contracts: int = 1,
+) -> float:
+    if yes_platform == "polymarket":
+        yes_fee = polymarket_order_fee(exit_yes_price, contracts, poly_fee_rate)
+        no_fee = kalshi_order_fee(exit_no_price, contracts)
+    else:
+        yes_fee = kalshi_order_fee(exit_yes_price, contracts)
+        no_fee = polymarket_order_fee(exit_no_price, contracts, poly_fee_rate)
+    return yes_fee + no_fee
 
 
 def estimate_round_trip_fees(
@@ -123,38 +183,43 @@ def estimate_round_trip_fees(
     exit_yes_price: float,
     exit_no_price: float,
     yes_platform: str,
+    poly_fee_rate: float,
+    contracts: int = 1,
 ) -> float:
-    """
-    Estimate fees for a full round trip (enter + exit), no resolution.
-
-    Each platform charges a fee on the profit of each individual trade.
-    If you buy at 0.40 and sell at 0.48, your profit is 0.08 and the
-    fee applies to that 0.08.
-    If you buy at 0.60 and sell at 0.55, you lost money -- no fee.
-    """
-    yes_rate = POLY_FEE_RATE if yes_platform == "polymarket" else KALSHI_FEE_RATE
-    no_rate = KALSHI_FEE_RATE if yes_platform == "polymarket" else POLY_FEE_RATE
-
-    # YES leg profit (buy low, sell higher after convergence)
-    yes_profit = max(0, exit_yes_price - entry_yes_price)
-    yes_fee = yes_rate * yes_profit
-
-    # NO leg profit (buy low, sell higher after convergence)
-    no_profit = max(0, exit_no_price - entry_no_price)
-    no_fee = no_rate * no_profit
-
-    return yes_fee + no_fee + config.ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE
+    return estimate_entry_fees(
+        entry_yes_price,
+        entry_no_price,
+        yes_platform,
+        poly_fee_rate,
+        contracts=contracts,
+    ) + estimate_exit_fees(
+        exit_yes_price,
+        exit_no_price,
+        yes_platform,
+        poly_fee_rate,
+        contracts=contracts,
+    )
 
 
-def estimate_entry_exit_fees_simple(spread_width: float, yes_platform: str) -> float:
-    """
-    Quick estimate: if the spread fully closes, each leg gains ~half the spread.
-    Conservative: assume both legs are profitable and both get taxed.
-    """
-    yes_rate = POLY_FEE_RATE if yes_platform == "polymarket" else KALSHI_FEE_RATE
-    no_rate = KALSHI_FEE_RATE if yes_platform == "polymarket" else POLY_FEE_RATE
-    avg_rate = (yes_rate + no_rate) / 2
-    return (avg_rate * spread_width) + config.ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE
+def estimate_entry_exit_fees_simple(
+    entry_yes_price: float,
+    entry_no_price: float,
+    yes_platform: str,
+    poly_fee_rate: float,
+    exit_yes_price: float | None = None,
+) -> float:
+    if exit_yes_price is None:
+        exit_yes_price = 0.5
+    exit_yes_price = _clamp_price(exit_yes_price)
+    exit_no_price = _clamp_price(1.0 - exit_yes_price)
+    return estimate_round_trip_fees(
+        entry_yes_price,
+        entry_no_price,
+        exit_yes_price,
+        exit_no_price,
+        yes_platform,
+        poly_fee_rate,
+    ) + config.ARB_ESTIMATED_ROUND_TRIP_SLIPPAGE
 
 
 # -- Price fetching (unchanged from before) ------------------------------------
@@ -217,6 +282,14 @@ def fetch_snapshot(
         snap.poly_yes_ask = quotes.get("yes_ask")
         snap.poly_no_bid = quotes.get("no_bid")
         snap.poly_no_ask = quotes.get("no_ask")
+        try:
+            snap.poly_yes_fee_rate = poly.get_fee_rate(pair.poly.token_yes)
+        except Exception as e:
+            logger.warning("Poly fee lookup failed for YES token %s: %s", pair.poly.token_yes[:12], e)
+        try:
+            snap.poly_no_fee_rate = poly.get_fee_rate(pair.poly.token_no)
+        except Exception as e:
+            logger.warning("Poly fee lookup failed for NO token %s: %s", pair.poly.token_no[:12], e)
     except Exception as e:
         logger.warning("Poly price fetch failed for %s: %s", pair.poly.question[:30], e)
 
@@ -277,8 +350,17 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
         entry_no = snapshot.kalshi_no_ask if snapshot.kalshi_no_ask is not None else (1.0 - k_yes_ref)
         entry_cost = entry_yes + entry_no
 
-        fees = estimate_entry_exit_fees_simple(divergence, "polymarket")
+        poly_fee_rate = snapshot.poly_yes_fee_rate or 0.0
+        est_exit_yes = _clamp_price((k_yes_ref + p_yes_ref) / 2)
+        fees = estimate_entry_exit_fees_simple(
+            entry_yes,
+            entry_no,
+            "polymarket",
+            poly_fee_rate,
+            exit_yes_price=est_exit_yes,
+        )
         net = divergence - fees
+        entry_fees = estimate_entry_fees(entry_yes, entry_no, "polymarket", poly_fee_rate)
 
         if divergence > 0:
             opp = SpreadOpportunity(
@@ -286,7 +368,7 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
                 direction=SpreadDirection.KALSHI_HIGHER,
                 snapshot=snapshot,
                 spread_width=divergence,
-                entry_cost_per_contract=entry_cost,
+                entry_cost_per_contract=entry_cost + entry_fees,
                 est_round_trip_fees=fees,
                 net_edge=net,
                 cheap_yes_price=entry_yes,
@@ -300,6 +382,7 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
                 if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
                 else None,
                 kalshi_leg_available_qty=snapshot.kalshi_no_ask_qty,
+                poly_fee_rate=poly_fee_rate,
             )
             if best is None or opp.net_edge > best.net_edge:
                 best = opp
@@ -313,8 +396,17 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
         entry_no = snapshot.poly_no_ask if snapshot.poly_no_ask is not None else (1.0 - p_yes_ref)
         entry_cost = entry_yes + entry_no
 
-        fees = estimate_entry_exit_fees_simple(divergence, "kalshi")
+        poly_fee_rate = snapshot.poly_no_fee_rate or 0.0
+        est_exit_yes = _clamp_price((k_yes_ref + p_yes_ref) / 2)
+        fees = estimate_entry_exit_fees_simple(
+            entry_yes,
+            entry_no,
+            "kalshi",
+            poly_fee_rate,
+            exit_yes_price=est_exit_yes,
+        )
         net = divergence - fees
+        entry_fees = estimate_entry_fees(entry_yes, entry_no, "kalshi", poly_fee_rate)
 
         if divergence > 0:
             opp = SpreadOpportunity(
@@ -322,7 +414,7 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
                 direction=SpreadDirection.POLY_HIGHER,
                 snapshot=snapshot,
                 spread_width=divergence,
-                entry_cost_per_contract=entry_cost,
+                entry_cost_per_contract=entry_cost + entry_fees,
                 est_round_trip_fees=fees,
                 net_edge=net,
                 cheap_yes_price=entry_yes,
@@ -336,6 +428,7 @@ def detect_spread(snapshot: PriceSnapshot) -> SpreadOpportunity | None:
                 if snapshot.kalshi_yes_mid is not None and snapshot.kalshi_no_bid is not None and snapshot.kalshi_no_ask is not None
                 else None,
                 kalshi_leg_available_qty=snapshot.kalshi_yes_ask_qty,
+                poly_fee_rate=poly_fee_rate,
             )
             if best is None or opp.net_edge > best.net_edge:
                 best = opp

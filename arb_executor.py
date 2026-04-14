@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 
 from kalshi_client import KalshiClient, Order as KalshiOrder
 from polymarket_client import PolymarketClient
-from arb_scanner import SpreadOpportunity, SpreadDirection, _kalshi_book_to_prices, estimate_round_trip_fees
+from arb_scanner import (
+    SpreadOpportunity,
+    SpreadDirection,
+    _kalshi_book_to_prices,
+    estimate_entry_fees,
+    estimate_exit_fees,
+)
 from position_manager import PositionManager, ArbPosition
 import config
 from trade_logger import log_execution
@@ -445,6 +451,7 @@ class ArbExecutor:
             result.poly_order_id = poly_meta.get("order_id")
             result.poly_status = poly_meta.get("status")
             result.poly_error = poly_meta.get("error")
+            result.poly_partial = bool(poly_meta.get("partial"))
         except Exception as e:
             result.poly_error = str(e)
             logger.error("Poly exit failed: %s", e)
@@ -456,6 +463,7 @@ class ArbExecutor:
             result.kalshi_order_id = kalshi_meta.get("order_id")
             result.kalshi_status = kalshi_meta.get("status")
             result.kalshi_error = kalshi_meta.get("error")
+            result.kalshi_partial = bool(kalshi_meta.get("partial"))
         except Exception as e:
             result.kalshi_error = str(e)
             logger.error("Kalshi exit failed: %s", e)
@@ -469,7 +477,7 @@ class ArbExecutor:
             cooldown_sec = config.ARB_EXIT_COOLDOWN_SECONDS
             self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
             logger.info("Post-exit cooldown: %s blocked for %ds (reason: %s)", cooldown_key, cooldown_sec, reason)
-        elif result.one_leg_only:
+        elif result.one_leg_only or result.poly_partial or result.kalshi_partial:
             self._warn_partial("EXIT", label, result)
             if not self.allow_partials:
                 self._handle_exit_partial(pos, result)
@@ -555,10 +563,18 @@ class ArbExecutor:
                 pos.no_entry_price = poly_fill
 
         if poly_fill is not None or kalshi_fill is not None:
-            pos.entry_cost = (pos.yes_entry_price + pos.no_entry_price) * pos.contracts
+            gross_entry_cost = (pos.yes_entry_price + pos.no_entry_price) * pos.contracts
+            entry_fees = estimate_entry_fees(
+                pos.yes_entry_price,
+                pos.no_entry_price,
+                pos.yes_platform,
+                pos.poly_fee_rate,
+                contracts=pos.contracts,
+            )
+            pos.entry_cost = gross_entry_cost + entry_fees
             logger.info(
-                "Entry fill prices for %s: yes=%.4f no=%.4f (cost $%.4f)",
-                pos.id, pos.yes_entry_price, pos.no_entry_price, pos.entry_cost,
+                "Entry fill prices for %s: yes=%.4f no=%.4f gross $%.4f fees $%.4f total $%.4f",
+                pos.id, pos.yes_entry_price, pos.no_entry_price, gross_entry_cost, entry_fees, pos.entry_cost,
             )
             self.positions._save()
 
@@ -588,11 +604,12 @@ class ArbExecutor:
             exit_no = poly_fill if poly_fill is not None else pos.current_no_bid or pos.no_entry_price
 
         exit_proceeds = (exit_yes + exit_no) * pos.contracts
-        fees = estimate_round_trip_fees(
-            pos.yes_entry_price, pos.no_entry_price,
+        fees = estimate_exit_fees(
             exit_yes, exit_no,
             pos.yes_platform,
-        ) * pos.contracts
+            pos.poly_fee_rate,
+            contracts=pos.contracts,
+        )
         realized = exit_proceeds - pos.entry_cost - fees
         logger.info(
             "P&L detail for %s: exit_yes=%.4f exit_no=%.4f proceeds=%.4f "
@@ -679,7 +696,12 @@ class ArbExecutor:
 
     def _exit_poly_with_escalation(self, token_id: str, contracts: int) -> tuple[bool, dict]:
         attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
-        last_meta = {"error": "poly exit not attempted", "status": "failed", "order_id": None}
+        last_meta = {
+            "error": "poly exit not attempted",
+            "status": "failed",
+            "order_id": None,
+            "partial": False,
+        }
 
         self.poly.refresh_conditional_allowance(token_id)
 
@@ -755,23 +777,43 @@ class ArbExecutor:
                     status = str(poly_result.get("status", "posted"))
 
                 if not order_id:
-                    return True, {"order_id": None, "status": status, "error": None, "fill_price": sell_price}
+                    return True, {
+                        "order_id": None,
+                        "status": status,
+                        "error": None,
+                        "fill_price": sell_price,
+                        "partial": False,
+                    }
 
-                filled, latest_status = self._wait_for_poly_fill(order_id)
+                filled, partial, latest_status = self._wait_for_poly_fill(order_id)
                 if filled:
                     fill_price = self._get_poly_fill_price(order_id, sell_price)
-                    return True, {"order_id": order_id, "status": latest_status, "error": None, "fill_price": fill_price}
+                    return True, {
+                        "order_id": order_id,
+                        "status": latest_status,
+                        "error": None,
+                        "fill_price": fill_price,
+                        "partial": False,
+                    }
 
                 try:
                     self.poly.cancel(order_id)
                 except Exception:
                     pass
 
+                err = (
+                    f"partial fill after attempt {attempt + 1}"
+                    if partial
+                    else f"unfilled after attempt {attempt + 1}"
+                )
                 last_meta = {
-                    "error": f"unfilled after attempt {attempt + 1}",
+                    "error": err,
                     "status": latest_status,
                     "order_id": order_id,
+                    "partial": partial,
                 }
+                if partial:
+                    return False, last_meta
 
             if balance_error and sell_size == float(contracts) and full_size_retries < 3:
                 # Full-size sell failed.  If reduced sizes would be below the
@@ -790,7 +832,12 @@ class ArbExecutor:
 
     def _exit_kalshi_with_escalation(self, ticker: str, side: str, contracts: int) -> tuple[bool, dict]:
         attempts = max(0, config.ARB_EXIT_REPRICE_ATTEMPTS)
-        last_meta = {"error": "kalshi exit not attempted", "status": "failed", "order_id": None}
+        last_meta = {
+            "error": "kalshi exit not attempted",
+            "status": "failed",
+            "order_id": None,
+            "partial": False,
+        }
         for attempt in range(attempts + 1):
             yes_price, no_price = self._exit_kalshi_limit_prices(ticker, side)
             if attempt == attempts:
@@ -814,39 +861,61 @@ class ArbExecutor:
             )
             if self._kalshi_order_is_filled(order.status):
                 fill_price = self._get_kalshi_fill_price(order.order_id, side)
-                return True, {"order_id": order.order_id, "status": order.status, "error": None, "fill_price": fill_price}
+                return True, {
+                    "order_id": order.order_id,
+                    "status": order.status,
+                    "error": None,
+                    "fill_price": fill_price,
+                    "partial": False,
+                }
 
-            filled, latest_status = self._wait_for_kalshi_fill(order.order_id)
+            filled, partial, latest_status = self._wait_for_kalshi_fill(order.order_id)
             if filled:
                 fill_price = self._get_kalshi_fill_price(order.order_id, side)
-                return True, {"order_id": order.order_id, "status": latest_status, "error": None, "fill_price": fill_price}
+                return True, {
+                    "order_id": order.order_id,
+                    "status": latest_status,
+                    "error": None,
+                    "fill_price": fill_price,
+                    "partial": False,
+                }
 
             try:
                 self.kalshi.cancel_order(order.order_id)
             except Exception:
                 pass
 
+            err = (
+                f"partial fill after attempt {attempt + 1}"
+                if partial
+                else f"unfilled after attempt {attempt + 1}"
+            )
             last_meta = {
-                "error": f"unfilled after attempt {attempt + 1}",
+                "error": err,
                 "status": latest_status,
                 "order_id": order.order_id,
+                "partial": partial,
             }
+            if partial:
+                return False, last_meta
 
         return False, last_meta
 
-    def _wait_for_poly_fill(self, order_id: str) -> tuple[bool, str]:
+    def _wait_for_poly_fill(self, order_id: str) -> tuple[bool, bool, str]:
         deadline = time.time() + max(1, config.ARB_EXIT_FILL_TIMEOUT_SECONDS)
         last_status = "posted"
+        partial = False
         while time.time() < deadline:
             try:
-                order = self.poly.get_order(order_id)
-                last_status = str((order or {}).get("status", last_status)).lower()
-                if last_status in {"filled", "matched", "executed"}:
-                    return True, last_status
+                filled, is_partial, latest_status = self.poly.get_order_fill_state(order_id)
+                last_status = latest_status
+                partial = partial or is_partial
+                if filled:
+                    return True, False, last_status
             except Exception:
                 pass
             time.sleep(0.4)
-        return False, last_status
+        return False, partial, last_status
 
     def _wait_for_poly_entry_fill(
         self,
@@ -881,20 +950,22 @@ class ArbExecutor:
             return False, True, status, f"partial fill ({status})"
         return False, False, status, f"unfilled ({status})"
 
-    def _wait_for_kalshi_fill(self, order_id: str) -> tuple[bool, str]:
+    def _wait_for_kalshi_fill(self, order_id: str) -> tuple[bool, bool, str]:
         deadline = time.time() + max(1, config.ARB_EXIT_FILL_TIMEOUT_SECONDS)
         last_status = "posted"
+        partial = False
         while time.time() < deadline:
             try:
                 order = self.kalshi.get_order(order_id)
                 if order:
                     last_status = order.status
                     if self._kalshi_order_is_filled(last_status):
-                        return True, last_status
+                        return True, False, last_status
+                    partial = partial or (order.fill_count or 0) > 0
             except Exception:
                 pass
             time.sleep(0.4)
-        return False, last_status
+        return False, partial, last_status
 
     def _wait_for_kalshi_entry_fill(
         self,
@@ -1015,6 +1086,7 @@ class ArbExecutor:
         elif result.kalshi_success and not result.poly_success:
             self._emergency_flatten_poly(poly_token, pos.contracts)
         pos.status = "stuck_exit"
+        self.positions._save()
         self._trip_emergency_stop(f"partial exit on {pos.pair_label}")
 
     def _emergency_flatten_poly(self, token_id: str, contracts: int):
