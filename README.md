@@ -177,6 +177,8 @@ All settings in `.env`:
 | `ARB_MAX_SIGNAL_AGE_SECONDS` | `8` | Reject stale signals between detection and order submit |
 | `ARB_EXIT_TARGET_PCT` | `0.60` | Exit when divergence compresses by this fraction (0.60 = 60% compression) |
 | `ARB_STOP_LOSS_PCT` | `1.00` | Exit when divergence widens by this fraction beyond entry (1.00 = doubles from entry) |
+| `ARB_STALE_EXIT_SECONDS` | `75` | Exit stale trades after this many seconds if they still have not shown enough compression and are not at breakeven |
+| `ARB_STALE_MIN_COMPRESSION_PCT` | `0.10` | Minimum spread compression required by the stale-exit check (0.10 = 10%) |
 
 ### Execution controls
 
@@ -212,13 +214,14 @@ The position manager tracks the live cross-platform YES divergence for each open
 |---|---|---|
 | **Target** | Divergence narrows to 40% of entry width (60% compression) **and** unrealized P&L >= $0 | Take profit — close both legs |
 | **Stop-loss** | Divergence widens to 200% of entry width (or trailing stop level) | Cut losses — close both legs |
+| **Stale** | Position has been open for `ARB_STALE_EXIT_SECONDS` and still has less than `ARB_STALE_MIN_COMPRESSION_PCT` compression while unrealized P&L is negative or flat | Cut slow/non-improving trades before they drift into larger losses |
 | **Time stop** | BTC window has < 120s remaining | Force exit — close both legs regardless of P&L |
 
 The target exit includes a P&L floor: it will not fire if the actual unrealized P&L is negative, even when the divergence metric has compressed past the threshold. This prevents locking in a loss to bid-ask friction on a "profitable" divergence move. The time stop and stop-loss fire unconditionally.
 
 A **trailing stop** ratchets the stop-loss tighter as the position moves in your favor. Once the divergence has compressed 40% from entry, the stop-loss moves to breakeven (entry spread). At 60% compression, it tightens to 70% of entry spread. The stop never moves back — it only gets tighter.
 
-Exit target and stop-loss thresholds are configurable via `ARB_EXIT_TARGET_PCT` and `ARB_STOP_LOSS_PCT` environment variables.
+Exit target, stop-loss, and stale-trade thresholds are configurable via `ARB_EXIT_TARGET_PCT`, `ARB_STOP_LOSS_PCT`, `ARB_STALE_EXIT_SECONDS`, and `ARB_STALE_MIN_COMPRESSION_PCT`.
 
 ## Live Execution Notes
 

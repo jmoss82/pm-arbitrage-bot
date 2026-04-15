@@ -75,6 +75,10 @@ ARB_MIN_KALSHI_LEVEL_QTY = int(os.getenv("ARB_MIN_KALSHI_LEVEL_QTY", "10"))
 ARB_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("ARB_MAX_SIGNAL_AGE_SECONDS", "8"))
 ARB_EXIT_TARGET_PCT = float(os.getenv("ARB_EXIT_TARGET_PCT", "0.60"))
 ARB_STOP_LOSS_PCT = float(os.getenv("ARB_STOP_LOSS_PCT", "1.00"))
+ARB_STALE_EXIT_SECONDS = int(os.getenv("ARB_STALE_EXIT_SECONDS", "75"))
+ARB_STALE_MIN_COMPRESSION_PCT = float(
+    os.getenv("ARB_STALE_MIN_COMPRESSION_PCT", "0.10")
+)
 
 # Limit order / execution controls
 ARB_POLY_LIMIT_OFFSET = float(os.getenv("ARB_POLY_LIMIT_OFFSET", "0.00"))

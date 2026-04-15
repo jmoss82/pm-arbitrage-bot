@@ -100,6 +100,8 @@ class PositionManager:
         self.closed_positions: list[ArbPosition] = []
         self.exit_target_pct = exit_target_pct if exit_target_pct is not None else _cfg.ARB_EXIT_TARGET_PCT
         self.stop_loss_pct = stop_loss_pct if stop_loss_pct is not None else _cfg.ARB_STOP_LOSS_PCT
+        self.stale_exit_seconds = _cfg.ARB_STALE_EXIT_SECONDS
+        self.stale_min_compression_pct = _cfg.ARB_STALE_MIN_COMPRESSION_PCT
         self._load()
 
     # -- Position creation -----------------------------------------------------
@@ -234,6 +236,24 @@ class PositionManager:
                 signals.append((pos, "stop_loss"))
                 logger.warning("EXIT SIGNAL [stop]: %s spread %.4f >= stop %.4f",
                                pos.pair_label, pos.current_spread, pos.stop_loss_spread)
+
+            # Stale trade: enough time has passed without meaningful compression
+            # and the position still is not at least breakeven.
+            elif (
+                self.stale_exit_seconds > 0
+                and pos.hold_time_seconds >= self.stale_exit_seconds
+                and pos.spread_compression_pct < self.stale_min_compression_pct
+                and pos.unrealized_pnl <= 0
+            ):
+                signals.append((pos, "stale"))
+                logger.info(
+                    "EXIT SIGNAL [stale]: %s age %.0fs compression %.0f%% < %.0f%% (pnl $%.2f)",
+                    pos.pair_label,
+                    pos.hold_time_seconds,
+                    pos.spread_compression_pct * 100,
+                    self.stale_min_compression_pct * 100,
+                    pos.unrealized_pnl,
+                )
 
         return signals
 
