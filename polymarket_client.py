@@ -83,6 +83,25 @@ class PolymarketClient:
     QUOTE_RETRIES = 2
     QUOTE_RETRY_DELAY_SECONDS = 0.15
 
+    @staticmethod
+    def _normalize_quote_pair(
+        bid: float | None,
+        ask: float | None,
+    ) -> tuple[float | None, float | None]:
+        def _clean(value: float | None) -> float | None:
+            if value is None:
+                return None
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                return None
+
+        bid = _clean(bid)
+        ask = _clean(ask)
+        if bid is not None and ask is not None and bid > ask:
+            bid, ask = ask, bid
+        return bid, ask
+
     def __init__(self, derive_keys: bool = True):
         self.clob = self._init_clob(derive_keys)
         self._fee_rate_cache_bps: dict[str, int] = {}
@@ -275,7 +294,7 @@ class PolymarketClient:
                         if mid is not None:
                             best_bid = mid - 0.005
                             best_ask = mid + 0.005
-                    return best_bid, best_ask
+                    return self._normalize_quote_pair(best_bid, best_ask)
 
                 # Book is partially or fully empty — use midpoint as
                 # last-resort fallback regardless of allow_midpoint_fallback
@@ -288,7 +307,7 @@ class PolymarketClient:
                         if best_ask is None:
                             best_ask = mid + 0.005
 
-                return best_bid, best_ask
+                return self._normalize_quote_pair(best_bid, best_ask)
             except Exception as e:
                 last_error = e
                 if attempt < self.QUOTE_RETRIES:

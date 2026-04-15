@@ -89,13 +89,18 @@ Prediction Market Arbitrage/
 |-- arb_scanner.py           Cross-platform divergence detection with fee model
 |-- arb_executor.py          Entry + exit execution on both platforms
 |-- position_manager.py      Open position tracking, exit signals, persistence
+|-- trade_logger.py          Structured signal / execution / lifecycle telemetry writers
 |-- spread_monitor.py        Single-market live spread tracker with CSV export
 |-- btc15m_monitor.py        BTC 15-minute auto-discovery monitor with executable edge logging
+|-- Dockerfile               Container build for Railway / Render
+|-- railway.json             Railway restart policy / service config
+|-- render.yaml              Render worker parity config
+|-- STRATEGY.md              Notes and research context for the BTC 15m approach
 |
 |-- .env                     API credentials (gitignored)
 |-- .env.example             Credential template
 |-- requirements.txt         Python dependencies
-|-- data/                    Position state, pair mappings, BTC monitor CSV captures
+|-- data/                    Position state, pair mappings, BTC monitor CSV captures, runtime telemetry
 ```
 
 ## Setup
@@ -146,7 +151,9 @@ python btc15m_monitor.py --interval 2
 
 ## Configuration
 
-All settings in `.env`:
+Runtime defaults are defined in `config.py`. `.env.example` is a starter template for local setup; if there is ever a mismatch, treat `config.py` as the source of truth.
+
+Core arbitrage settings in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|

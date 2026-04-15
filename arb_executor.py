@@ -366,6 +366,11 @@ class ArbExecutor:
         poly_token, poly_price, kalshi_side, kalshi_price_cents = self._entry_params(opp)
         poly_price = self._entry_poly_price(opp, poly_price)
         kalshi_price_cents = self._entry_kalshi_price(opp, kalshi_side, kalshi_price_cents)
+        poly_starting_balance = None
+        try:
+            poly_starting_balance = self.poly.get_conditional_token_balance(poly_token)
+        except Exception:
+            poly_starting_balance = None
 
         # Place Polymarket leg
         try:
@@ -391,37 +396,52 @@ class ArbExecutor:
                     result.poly_partial,
                     result.poly_status,
                     result.poly_error,
-                ) = self._wait_for_poly_entry_fill(result.poly_order_id, result.poly_status)
+                ) = self._wait_for_poly_entry_fill(
+                    result.poly_order_id,
+                    result.poly_status,
+                    token_id=poly_token,
+                    expected_size=float(contracts),
+                    starting_balance=poly_starting_balance,
+                )
         except Exception as e:
             result.poly_error = str(e)
             logger.error("Poly entry failed: %s", e)
 
-        # Place Kalshi leg
-        try:
-            order = self.kalshi.create_order(
-                ticker=opp.pair.kalshi_ticker,
-                side=kalshi_side,
-                action="buy",
-                count=contracts,
-                yes_price=kalshi_price_cents if kalshi_side == "yes" else None,
-                no_price=kalshi_price_cents if kalshi_side == "no" else None,
-                client_order_id=f"arb-e-{uuid.uuid4().hex[:8]}",
+        if not result.poly_success:
+            result.kalshi_error = "skipped: poly leg not confirmed filled"
+            logger.warning(
+                "Skipping Kalshi entry for %s because Polymarket leg was not confirmed filled (status=%s error=%s)",
+                label,
+                result.poly_status,
+                result.poly_error,
             )
-            result.kalshi_order_id = order.order_id
-            (
-                result.kalshi_success,
-                result.kalshi_partial,
-                result.kalshi_status,
-            ) = self._wait_for_kalshi_entry_fill(order.order_id, order.status)
-            if not result.kalshi_success:
-                result.kalshi_error = (
-                    f"partial fill ({result.kalshi_status})"
-                    if result.kalshi_partial
-                    else f"unfilled ({result.kalshi_status})"
+        else:
+        # Place Kalshi leg
+            try:
+                order = self.kalshi.create_order(
+                    ticker=opp.pair.kalshi_ticker,
+                    side=kalshi_side,
+                    action="buy",
+                    count=contracts,
+                    yes_price=kalshi_price_cents if kalshi_side == "yes" else None,
+                    no_price=kalshi_price_cents if kalshi_side == "no" else None,
+                    client_order_id=f"arb-e-{uuid.uuid4().hex[:8]}",
                 )
-        except Exception as e:
-            result.kalshi_error = str(e)
-            logger.error("Kalshi entry failed: %s", e)
+                result.kalshi_order_id = order.order_id
+                (
+                    result.kalshi_success,
+                    result.kalshi_partial,
+                    result.kalshi_status,
+                ) = self._wait_for_kalshi_entry_fill(order.order_id, order.status)
+                if not result.kalshi_success:
+                    result.kalshi_error = (
+                        f"partial fill ({result.kalshi_status})"
+                        if result.kalshi_partial
+                        else f"unfilled ({result.kalshi_status})"
+                    )
+            except Exception as e:
+                result.kalshi_error = str(e)
+                logger.error("Kalshi entry failed: %s", e)
 
         if result.both_filled:
             self.ledger.daily_spent += result.total_cost_usd
@@ -501,17 +521,26 @@ class ArbExecutor:
             result.poly_error = str(e)
             logger.error("Poly exit failed: %s", e)
 
-        # Sell on Kalshi with escalation if passive exits do not fill.
-        try:
-            kalshi_success, kalshi_meta = self._exit_kalshi_with_escalation(pos.kalshi_ticker, kalshi_side, pos.contracts)
-            result.kalshi_success = kalshi_success
-            result.kalshi_order_id = kalshi_meta.get("order_id")
-            result.kalshi_status = kalshi_meta.get("status")
-            result.kalshi_error = kalshi_meta.get("error")
-            result.kalshi_partial = bool(kalshi_meta.get("partial"))
-        except Exception as e:
-            result.kalshi_error = str(e)
-            logger.error("Kalshi exit failed: %s", e)
+        if not result.poly_success:
+            result.kalshi_error = "skipped: poly exit leg not confirmed filled"
+            logger.warning(
+                "Skipping Kalshi exit for %s because Polymarket exit leg was not confirmed filled (status=%s error=%s)",
+                label,
+                result.poly_status,
+                result.poly_error,
+            )
+        else:
+            # Sell on Kalshi with escalation if passive exits do not fill.
+            try:
+                kalshi_success, kalshi_meta = self._exit_kalshi_with_escalation(pos.kalshi_ticker, kalshi_side, pos.contracts)
+                result.kalshi_success = kalshi_success
+                result.kalshi_order_id = kalshi_meta.get("order_id")
+                result.kalshi_status = kalshi_meta.get("status")
+                result.kalshi_error = kalshi_meta.get("error")
+                result.kalshi_partial = bool(kalshi_meta.get("partial"))
+            except Exception as e:
+                result.kalshi_error = str(e)
+                logger.error("Kalshi exit failed: %s", e)
 
         if result.both_filled:
             realized = self._compute_realized_pnl(pos, poly_meta, kalshi_meta, kalshi_side)
@@ -966,11 +995,21 @@ class ArbExecutor:
         self,
         order_id: str | None,
         initial_status: str | None,
+        token_id: str,
+        expected_size: float,
+        starting_balance: float | None = None,
     ) -> tuple[bool, bool, str, str | None]:
         status = str(initial_status or "posted").lower()
         if status in {"filled", "matched", "executed", "complete", "completed"}:
             return True, False, status, None
         if not order_id:
+            filled, partial, reconciled_status, reconciled_error = self._reconcile_poly_entry_fill(
+                token_id,
+                expected_size,
+                starting_balance,
+            )
+            if filled or partial:
+                return filled, partial, reconciled_status, reconciled_error
             return False, False, status, f"missing order id ({status})"
 
         deadline = time.time() + max(1, config.ARB_ORDER_TIMEOUT_SECONDS)
@@ -991,9 +1030,69 @@ class ArbExecutor:
         except Exception:
             pass
 
+        filled, reconciled_partial, reconciled_status, reconciled_error = self._reconcile_poly_entry_fill(
+            token_id,
+            expected_size,
+            starting_balance,
+        )
+        if filled or reconciled_partial:
+            return filled, reconciled_partial, reconciled_status, reconciled_error
+
         if partial:
             return False, True, status, f"partial fill ({status})"
         return False, False, status, f"unfilled ({status})"
+
+    def _reconcile_poly_entry_fill(
+        self,
+        token_id: str,
+        expected_size: float,
+        starting_balance: float | None,
+    ) -> tuple[bool, bool, str, str | None]:
+        """Use conditional-token balance delta as a fallback fill signal.
+
+        This is a safety net for cases where the order was accepted and filled
+        on Polymarket, but order-status polling or cancellation responses are
+        stale or unavailable. We only trust it when we can observe a material
+        increase in the token balance versus the pre-order baseline.
+        """
+        if expected_size <= 0:
+            return False, False, "unreconciled", "invalid expected size"
+        if starting_balance is None:
+            return False, False, "unreconciled", "starting balance unavailable"
+
+        baseline = max(0.0, starting_balance)
+        for attempt in range(3):
+            try:
+                self.poly.refresh_conditional_allowance(token_id)
+                current_balance = self.poly.get_conditional_token_balance(token_id)
+            except Exception:
+                current_balance = None
+
+            if current_balance is not None:
+                delta = max(0.0, current_balance - baseline)
+                if delta >= max(_POLY_MIN_ORDER_SIZE, expected_size - _POLY_DUST_TOLERANCE):
+                    logger.warning(
+                        "Poly entry reconciled by balance delta: token=%s baseline=%.3f current=%.3f expected=%.3f",
+                        token_id,
+                        baseline,
+                        current_balance,
+                        expected_size,
+                    )
+                    return True, False, "filled-balance-reconciled", None
+                if delta >= _POLY_MIN_ORDER_SIZE:
+                    logger.warning(
+                        "Poly entry partial inferred by balance delta: token=%s baseline=%.3f current=%.3f expected=%.3f",
+                        token_id,
+                        baseline,
+                        current_balance,
+                        expected_size,
+                    )
+                    return False, True, "partial-balance-reconciled", f"partial fill inferred from balance delta ({delta:.3f}/{expected_size:.3f})"
+
+            if attempt < 2:
+                time.sleep(0.75)
+
+        return False, False, "unreconciled", "no balance delta observed"
 
     def _wait_for_kalshi_fill(self, order_id: str) -> tuple[bool, bool, str]:
         deadline = time.time() + max(1, config.ARB_EXIT_FILL_TIMEOUT_SECONDS)
