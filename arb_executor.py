@@ -1121,7 +1121,16 @@ class ArbExecutor:
         elif result.kalshi_success and not result.poly_success:
             _, _, kalshi_side, _ = self._entry_params(opp)
             self._emergency_flatten_kalshi(opp.pair.kalshi_ticker, kalshi_side, contracts)
-        self._trip_emergency_stop(f"partial entry on {opp.pair.label}")
+        cooldown_key = f"{opp.pair.kalshi_ticker}:{opp.direction.value}"
+        cooldown_sec = config.ARB_EXIT_COOLDOWN_SECONDS
+        self._stop_loss_cooldowns[cooldown_key] = time.time() + cooldown_sec
+        logger.warning(
+            "Partial entry cleanup completed; keeping bot active and blocking %s for %ds",
+            cooldown_key,
+            cooldown_sec,
+        )
+        print(f"      Entry cleanup completed; bot remains active")
+        print(f"      Cooldown: {cooldown_sec}s on {opp.pair.kalshi_ticker} {opp.direction.value}")
 
     def _handle_exit_partial(self, pos: ArbPosition, result: TradeResult):
         logger.warning("Partials disabled; attempting emergency flatten for exit on %s", pos.pair_label)
