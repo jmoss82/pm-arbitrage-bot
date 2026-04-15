@@ -86,6 +86,12 @@ class ArbPosition:
             return (self.last_update - self.entry_time) / 60
         return (time.time() - self.entry_time) / 60
 
+    @property
+    def hold_time_seconds(self) -> float:
+        if self.last_update > 0:
+            return self.last_update - self.entry_time
+        return time.time() - self.entry_time
+
 
 class PositionManager:
     """Manages the lifecycle of open arb positions."""
