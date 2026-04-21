@@ -314,14 +314,21 @@ def make_scanner_handler(
 
         session_state.open_positions_count = len(positions_mod.open_positions())
         if position.status == positions_mod.STATUS_ENTRY_FAILED:
+            if not position.extra.get("consume_window_slot", True):
+                session_state.release_attempt(ctx.window.slug)
             _append_signal_row(
                 signal_csv,
                 _signal_row_from(ctx, "accept_but_failed", position.submit_error or "", position),
             )
             latency = position.submit_latency_ms or 0.0
+            retry_note = (
+                "window slot released; may retry this window"
+                if not position.extra.get("consume_window_slot", True)
+                else "window slot consumed"
+            )
             out(f"  !! entry FAILED for {ctx.tick.window_slug} "
                 f"({position.submit_error}) after {latency:.0f}ms -- "
-                f"will retry on next window")
+                f"{retry_note}")
             return
 
         session_state.register_fill(position.entry_cost_usd or 0.0)
@@ -449,9 +456,9 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     await run_window_loop(
         poly,
         on_tick=[
+            make_scanner_handler(session_state, dry_run, signal_csv),
             make_tick_csv_handler(ticks_path),
             make_tty_handler(),
-            make_scanner_handler(session_state, dry_run, signal_csv),
             make_settler_handler(),
         ],
         on_window_end=[

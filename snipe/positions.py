@@ -183,7 +183,11 @@ def count_attempts_for_window(window_slug: str) -> int:
     Railway restart mid-window cannot re-submit into the slot we already
     took (or tried to take) pre-restart.
     """
-    return sum(1 for p in load_positions() if p.window_slug == window_slug)
+    return sum(
+        1
+        for p in load_positions()
+        if p.window_slug == window_slug and p.extra.get("consume_window_slot", True)
+    )
 
 
 def attempts_by_window_since(cutoff_utc_iso: str) -> dict[str, int]:
@@ -200,6 +204,8 @@ def attempts_by_window_since(cutoff_utc_iso: str) -> dict[str, int]:
         if not p.submitted_at_utc:
             continue
         if p.submitted_at_utc < cutoff_utc_iso:
+            continue
+        if not p.extra.get("consume_window_slot", True):
             continue
         out[p.window_slug] = out.get(p.window_slug, 0) + 1
     return out

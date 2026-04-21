@@ -44,6 +44,8 @@ class SessionState:
     while testing.
     """
     entries_by_window: dict[str, int] = field(default_factory=dict)
+    last_leader_by_window: dict[str, Optional[str]] = field(default_factory=dict)
+    leader_streak_by_window: dict[str, int] = field(default_factory=dict)
     total_spend_today_usd: float = 0.0
     last_spend_reset_utc_date: str = field(
         default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -76,6 +78,30 @@ class SessionState:
 
     def entries_this_window(self, window_slug: str) -> int:
         return self.entries_by_window.get(window_slug, 0)
+
+    def release_attempt(self, window_slug: str) -> None:
+        """Release a previously reserved window slot after a retriable miss."""
+        current = self.entries_by_window.get(window_slug, 0)
+        if current <= 1:
+            self.entries_by_window.pop(window_slug, None)
+        else:
+            self.entries_by_window[window_slug] = current - 1
+
+    def observe_leader(self, window_slug: str, leader_side: Optional[str]) -> int:
+        """Track consecutive ticks with the same leader for a window."""
+        prev = self.last_leader_by_window.get(window_slug)
+        if leader_side is None:
+            self.last_leader_by_window[window_slug] = None
+            self.leader_streak_by_window[window_slug] = 0
+            return 0
+
+        if prev == leader_side:
+            streak = self.leader_streak_by_window.get(window_slug, 0) + 1
+        else:
+            streak = 1
+        self.last_leader_by_window[window_slug] = leader_side
+        self.leader_streak_by_window[window_slug] = streak
+        return streak
 
 
 def _compute_size(position_usd: float, price: float) -> float:
@@ -125,6 +151,7 @@ def evaluate_tick(
     wrong time) dominate the rejection histogram over rarer reasons.
     """
     session.maybe_reset_daily()
+    leader_streak = session.observe_leader(window.slug, tick.leader_side)
 
     if tick.leader_side is None:
         return EntryDecision(False, "no_leader")
@@ -144,6 +171,12 @@ def evaluate_tick(
     ask_size = tick.leader_ask_size or 0.0
     if ask_size < config.SNIPE_MIN_TOP_OF_BOOK_SIZE:
         return EntryDecision(False, f"thin_book(size={ask_size:.0f})")
+
+    if leader_streak < config.SNIPE_MIN_LEADER_PERSIST_TICKS:
+        return EntryDecision(
+            False,
+            f"leader_unstable({leader_streak}/{config.SNIPE_MIN_LEADER_PERSIST_TICKS})",
+        )
 
     entries_this_window = session.entries_this_window(window.slug)
     if entries_this_window >= config.SNIPE_MAX_ENTRIES_PER_WINDOW:

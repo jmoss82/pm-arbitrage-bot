@@ -12,6 +12,7 @@ There is no exit leg.  Positions are held to settlement and resolved by
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,6 +31,13 @@ logger = logging.getLogger("snipe.executor")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _is_no_match_error(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    msg = text.lower()
+    return "no orders found to match" in msg or "fak_no_match" in msg
 
 
 def submit_fak_buy(
@@ -61,6 +69,34 @@ def _extract_order_id(resp: dict | None) -> Optional[str]:
     if isinstance(order, dict):
         return _extract_order_id(order)
     return None
+
+
+def _extract_order_id_from_error(exc: Exception) -> Optional[str]:
+    """Best-effort parse of an order id embedded in SDK exception text."""
+    for attr in ("error_message", "message", "args"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, dict):
+            order_id = _extract_order_id(value)
+            if order_id:
+                return order_id
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, dict):
+                    order_id = _extract_order_id(item)
+                    if order_id:
+                        return order_id
+                if isinstance(item, str):
+                    match = re.search(r"0x[a-fA-F0-9]{64}", item)
+                    if match:
+                        return match.group(0)
+        if isinstance(value, str):
+            match = re.search(r"0x[a-fA-F0-9]{64}", value)
+            if match:
+                return match.group(0)
+
+    text = str(exc)
+    match = re.search(r"0x[a-fA-F0-9]{64}", text)
+    return match.group(0) if match else None
 
 
 def _extract_status(resp: dict | None) -> Optional[str]:
@@ -99,6 +135,34 @@ def _extract_avg_price(resp: dict | None) -> Optional[float]:
     return None
 
 
+def _refresh_fill_state(
+    poly: PolymarketClient,
+    position: positions_mod.SnipePosition,
+) -> tuple[float, Optional[float], Optional[str]]:
+    """Best-effort follow-up read for ambiguous immediate post-order responses."""
+    if not position.order_id:
+        return 0.0, None, position.submit_status
+    try:
+        filled, partial, status = poly.get_order_fill_state(position.order_id)
+        avg = poly.get_order_avg_fill_price(position.order_id)
+        if filled:
+            matched = position.requested_size
+        elif partial:
+            order = poly.get_order(position.order_id) or {}
+            raw = (
+                order.get("size_matched")
+                or order.get("matchedSize")
+                or order.get("filled_size")
+            )
+            matched = float(raw) if raw is not None else 0.0
+        else:
+            matched = 0.0
+        return matched, avg, status
+    except Exception:
+        logger.exception("follow-up get_order failed for %s", position.order_id)
+        return 0.0, None, position.submit_status
+
+
 def execute_entry(
     poly: PolymarketClient,
     decision: EntryDecision,
@@ -133,6 +197,7 @@ def execute_entry(
         leader_ask_at_signal=tick.leader_ask,
         leader_ask_size_at_signal=tick.leader_ask_size,
     )
+    position.extra["consume_window_slot"] = True
 
     if dry_run:
         # Optimistic fill simulation: assume the quoted ask matches at its
@@ -165,9 +230,33 @@ def execute_entry(
             decision.size,  # type: ignore[arg-type]
         )
     except Exception as e:
+        position.order_id = _extract_order_id_from_error(e)
         position.submit_error = f"{type(e).__name__}: {e}"
         position.submit_latency_ms = (time.perf_counter() - submit_started) * 1000.0
+        if position.order_id:
+            matched, avg, status = _refresh_fill_state(poly, position)
+            position.submit_status = status
+            position.filled = matched > 0 and matched >= (decision.size or 0.0)
+            position.partial = 0.0 < matched < (decision.size or 0.0)
+            position.filled_size = matched if matched > 0 else 0.0
+            position.avg_fill_price = avg if matched > 0 else None
+            position.entry_cost_usd = (
+                round(avg * matched, 6) if (matched > 0 and avg is not None) else 0.0
+            )
+            if position.filled or position.partial:
+                try:
+                    position.entry_fee_rate_bps = poly.get_fee_rate_bps(decision.token_id)  # type: ignore[arg-type]
+                    position.entry_fee_usd = round(
+                        (position.entry_fee_rate_bps / 10_000.0) * (position.entry_cost_usd or 0.0),
+                        6,
+                    )
+                except Exception:
+                    position.entry_fee_rate_bps = None
+                    position.entry_fee_usd = None
+                positions_mod.upsert_position(position)
+                return position
         position.status = positions_mod.STATUS_ENTRY_FAILED
+        position.extra["consume_window_slot"] = not _is_no_match_error(position.submit_error)
         positions_mod.upsert_position(position)
         logger.exception("submit_fak_buy failed for %s", window.slug)
         return position
@@ -178,6 +267,12 @@ def execute_entry(
 
     matched = _extract_filled_size(resp) or 0.0
     avg = _extract_avg_price(resp) or decision.limit_price
+    if matched <= 0.0 and position.order_id:
+        matched, followup_avg, followup_status = _refresh_fill_state(poly, position)
+        if followup_status:
+            position.submit_status = followup_status
+        if followup_avg is not None:
+            avg = followup_avg
     position.filled = matched > 0 and (decision.size or 0.0) > 0 and matched >= (decision.size or 0.0)
     position.partial = 0.0 < matched < (decision.size or 0.0)
     position.filled_size = matched if matched > 0 else 0.0
@@ -192,6 +287,7 @@ def execute_entry(
     if not (position.filled or position.partial):
         position.status = positions_mod.STATUS_ENTRY_FAILED
         position.submit_error = position.submit_error or "fak_no_match"
+        position.extra["consume_window_slot"] = not _is_no_match_error(position.submit_error)
     else:
         # Fetch the live fee rate in the background path only; in the hot
         # loop this extra call is ~50-200ms and not worth the latency
