@@ -10,6 +10,7 @@ the trade-signal telemetry for later audit.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -78,10 +79,38 @@ class SessionState:
 
 
 def _compute_size(position_usd: float, price: float) -> float:
-    """Round share count to 2 decimals; Polymarket accepts fractional sizes."""
-    if price <= 0:
+    """Compute a share count whose USDC cost is exactly 2-decimal accurate.
+
+    Polymarket's CLOB rejects BUY orders whose maker amount (USDC) has more
+    than 2 decimals of precision -- see PolyApiException "invalid amounts,
+    the market buy orders maker amount supports a max accuracy of 2 decimals".
+    A naive ``round(usd / price, 2)`` does not satisfy this (e.g. 5.10 * 0.98
+    = 4.998, three decimals).
+
+    Given a 2-decimal price ``P/100`` and integer ``g = gcd(P, 100)``, the
+    set of 2-decimal sizes ``S/100`` whose product ``S * P / 100`` lands on
+    a whole cent is exactly the multiples of ``100 / g`` cents of shares.
+    We snap size DOWN to the largest such multiple that keeps total cost at
+    or below ``position_usd`` so we never overshoot the nominal position.
+
+    Examples at ``position_usd = $5.00``:
+
+        price 0.95 -> g=5,  step 0.20, size 5.20, cost $4.94
+        price 0.96 -> g=4,  step 0.25, size 5.00, cost $4.80
+        price 0.97 -> g=1,  step 1.00, size 5.00, cost $4.85
+        price 0.98 -> g=2,  step 0.50, size 5.00, cost $4.90
+        price 0.99 -> g=1,  step 1.00, size 5.00, cost $4.95
+    """
+    if price <= 0 or position_usd <= 0:
         return 0.0
-    return round(position_usd / price, 2)
+    price_cents = int(round(price * 100))
+    if price_cents <= 0:
+        return 0.0
+    step_cents = 100 // math.gcd(price_cents, 100)
+    # (position_usd / price) expressed in 0.01-share units.
+    max_raw_size_cents = (position_usd * 10000.0) / price_cents
+    size_cents = int(max_raw_size_cents // step_cents) * step_cents
+    return size_cents / 100.0
 
 
 def evaluate_tick(
