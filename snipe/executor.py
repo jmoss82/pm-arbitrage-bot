@@ -146,20 +146,10 @@ def _refresh_fill_state(
     if not position.order_id:
         return 0.0, None, position.submit_status
     try:
-        filled, partial, status = poly.get_order_fill_state(position.order_id)
-        avg = poly.get_order_avg_fill_price(position.order_id)
-        if filled:
-            matched = position.requested_size
-        elif partial:
-            order = poly.get_order(position.order_id) or {}
-            raw = (
-                order.get("size_matched")
-                or order.get("matchedSize")
-                or order.get("filled_size")
-            )
-            matched = float(raw) if raw is not None else 0.0
-        else:
-            matched = 0.0
+        details = poly.get_order_fill_details(position.order_id)
+        status = details.get("status") or position.submit_status
+        matched = float(details.get("matched_size") or 0.0)
+        avg = details.get("avg_price")
         return matched, avg, status
     except Exception:
         logger.exception("follow-up get_order failed for %s", position.order_id)
@@ -186,6 +176,23 @@ def _confirm_no_fill(
             time.sleep(NO_MATCH_CONFIRM_DELAY_S)
     position.extra["no_fill_confirm_attempts"] = NO_MATCH_CONFIRM_RETRIES
     return matched, avg, status, True
+
+
+def _apply_fill_result(
+    position: positions_mod.SnipePosition,
+    matched: float,
+    avg: Optional[float],
+    status: Optional[str],
+) -> None:
+    """Update the position from exchange-reported fill details."""
+    position.submit_status = status
+    position.filled = matched > 0.0
+    position.partial = False
+    position.filled_size = matched if matched > 0.0 else 0.0
+    position.avg_fill_price = avg if matched > 0.0 else None
+    position.entry_cost_usd = (
+        round(avg * matched, 6) if (matched > 0.0 and avg is not None) else 0.0
+    )
 
 
 def execute_entry(
@@ -262,15 +269,8 @@ def execute_entry(
         if position.order_id:
             matched, avg, status, confirmed_no_fill = _confirm_no_fill(poly, position)
             position.extra["confirmed_no_fill"] = confirmed_no_fill
-            position.submit_status = status
-            position.filled = matched > 0 and matched >= (decision.size or 0.0)
-            position.partial = 0.0 < matched < (decision.size or 0.0)
-            position.filled_size = matched if matched > 0 else 0.0
-            position.avg_fill_price = avg if matched > 0 else None
-            position.entry_cost_usd = (
-                round(avg * matched, 6) if (matched > 0 and avg is not None) else 0.0
-            )
-            if position.filled or position.partial:
+            _apply_fill_result(position, matched, avg, status)
+            if position.filled:
                 try:
                     position.entry_fee_rate_bps = poly.get_fee_rate_bps(decision.token_id)  # type: ignore[arg-type]
                     position.entry_fee_usd = round(
@@ -324,18 +324,12 @@ def execute_entry(
         if followup_avg is not None:
             avg = followup_avg
         position.extra["consume_window_slot"] = not confirmed_no_fill
-    position.filled = matched > 0 and (decision.size or 0.0) > 0 and matched >= (decision.size or 0.0)
-    position.partial = 0.0 < matched < (decision.size or 0.0)
-    position.filled_size = matched if matched > 0 else 0.0
-    position.avg_fill_price = avg if matched > 0 else None
-    position.entry_cost_usd = (
-        round(avg * matched, 6) if (matched > 0 and avg is not None) else 0.0
-    )
+    _apply_fill_result(position, matched, avg, position.submit_status)
 
     # FAK either filled or was cancelled.  A zero-match response means
     # the order died without taking any liquidity -- treat it as a failed
     # entry rather than an open position so the book is not polluted.
-    if not (position.filled or position.partial):
+    if not position.filled:
         position.status = positions_mod.STATUS_ENTRY_FAILED
         position.submit_error = position.submit_error or "fak_no_match"
         position.extra["failure_kind"] = "no_match"

@@ -341,13 +341,18 @@ def make_scanner_handler(
         _append_signal_row(signal_csv, _signal_row_from(ctx, "enter", decision.reason, position))
 
         tag = "DRY" if dry_run else "LIVE"
-        fill_note = (
-            f"filled={position.filled_size or 0:.2f} @ {position.avg_fill_price:.4f}"
-            if position.avg_fill_price is not None
-            else "no_fill_reported"
-        )
+        if position.avg_fill_price is not None:
+            fill_note = (
+                f"requested={position.requested_size:.2f} @ {position.requested_price:.4f}  "
+                f"actual={position.filled_size or 0:.2f} @ {position.avg_fill_price:.4f}"
+            )
+        else:
+            fill_note = (
+                f"requested={position.requested_size:.2f} @ {position.requested_price:.4f}  "
+                "actual=no_fill_reported"
+            )
         out(
-            f"  >> [{tag}] {ctx.tick.leader_side.upper()} {position.requested_size} @ {position.requested_price:.4f}  "
+            f"  >> [{tag}] {ctx.tick.leader_side.upper()} "
             f"t-{ctx.tick.seconds_remaining:.1f}s  {fill_note}  "
             f"({position.submit_latency_ms or 0:.0f}ms)"
         )

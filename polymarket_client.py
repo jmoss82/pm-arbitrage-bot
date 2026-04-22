@@ -445,6 +445,18 @@ class PolymarketClient:
     def get_order(self, order_id: str) -> dict:
         return self.clob.get_order(order_id)
 
+    @staticmethod
+    def _extract_float_field(payload: dict, keys: list[str]) -> float | None:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def get_order_avg_fill_price(self, order_id: str) -> float | None:
         """Return the average fill price for a filled order, or None."""
         order = self.get_order(order_id) or {}
@@ -456,21 +468,56 @@ class PolymarketClient:
                 pass
         return None
 
-    def get_order_fill_state(self, order_id: str) -> tuple[bool, bool, str]:
-        """Return (filled, partial, normalized_status) for an order."""
+    def get_order_fill_details(self, order_id: str) -> dict:
+        """Return normalized fill details from the exchange order record."""
         order = self.get_order(order_id) or {}
         status = str(order.get("status", "")).lower()
-        size_matched = order.get("size_matched") or order.get("matchedSize") or order.get("filled_size")
-        original_size = order.get("original_size") or order.get("size")
+        avg_price = self._extract_float_field(
+            order,
+            ["average_price", "averagePrice", "avg_price", "price"],
+        )
+        matched_size = self._extract_float_field(
+            order,
+            [
+                "size_matched",
+                "matchedSize",
+                "filled_size",
+                "filledSize",
+                "matched_size",
+            ],
+        )
+        original_size = self._extract_float_field(
+            order,
+            ["original_size", "size", "order_size", "quantity"],
+        )
+        if matched_size is None:
+            filled_value = self._extract_float_field(
+                order,
+                [
+                    "filled_amount",
+                    "filledAmount",
+                    "matched_amount",
+                    "matchedAmount",
+                    "filled_value",
+                ],
+            )
+            if filled_value is not None and avg_price and avg_price > 0:
+                matched_size = filled_value / avg_price
 
-        try:
-            matched = float(size_matched) if size_matched is not None else 0.0
-        except (TypeError, ValueError):
-            matched = 0.0
-        try:
-            total = float(original_size) if original_size is not None else 0.0
-        except (TypeError, ValueError):
-            total = 0.0
+        return {
+            "status": status or None,
+            "avg_price": avg_price,
+            "matched_size": matched_size,
+            "original_size": original_size,
+            "raw": order,
+        }
+
+    def get_order_fill_state(self, order_id: str) -> tuple[bool, bool, str]:
+        """Return (filled, partial, normalized_status) for an order."""
+        details = self.get_order_fill_details(order_id)
+        status = str(details.get("status") or "").lower()
+        matched = float(details.get("matched_size") or 0.0)
+        total = float(details.get("original_size") or 0.0)
 
         if status in {"filled", "matched", "executed", "complete", "completed"}:
             return True, False, status
