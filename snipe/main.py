@@ -326,9 +326,14 @@ def make_scanner_handler(
                 if not position.extra.get("consume_window_slot", True)
                 else "window slot consumed"
             )
+            confirm_note = (
+                f" confirmed_no_fill={position.extra.get('confirmed_no_fill')}"
+                if "confirmed_no_fill" in position.extra
+                else ""
+            )
             out(f"  !! entry FAILED for {ctx.tick.window_slug} "
                 f"({position.submit_error}) after {latency:.0f}ms -- "
-                f"{retry_note}")
+                f"{retry_note}{confirm_note}")
             return
 
         session_state.register_fill(position.entry_cost_usd or 0.0)
@@ -415,6 +420,16 @@ async def _cmd_run(args: argparse.Namespace) -> int:
                 f"(${config.SNIPE_MIN_POLY_BALANCE_USD:.2f})")
             return 2
         out(f"  [ok] USDC ${usdc:.2f}")
+        out("  Warming live order path...")
+        try:
+            warm = poly.warm_up_live_trading()
+            errors = warm.get("errors") or []
+            if errors:
+                out(f"  [warn] live warmup partial: {'; '.join(str(e) for e in errors)}")
+            else:
+                out("  [ok] live warmup complete")
+        except Exception as e:
+            out(f"  [warn] live warmup failed: {e}")
         out()
         out("  >>> LIVE MODE ARMED -- orders WILL be submitted to Polymarket <<<")
         if not args.yes:

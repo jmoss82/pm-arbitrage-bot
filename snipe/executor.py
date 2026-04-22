@@ -180,9 +180,11 @@ def _confirm_no_fill(
     for attempt in range(NO_MATCH_CONFIRM_RETRIES):
         matched, avg, status = _refresh_fill_state(poly, position)
         if matched > 0.0:
+            position.extra["no_fill_confirm_attempts"] = attempt + 1
             return matched, avg, status, False
         if attempt < NO_MATCH_CONFIRM_RETRIES - 1:
             time.sleep(NO_MATCH_CONFIRM_DELAY_S)
+    position.extra["no_fill_confirm_attempts"] = NO_MATCH_CONFIRM_RETRIES
     return matched, avg, status, True
 
 
@@ -255,9 +257,11 @@ def execute_entry(
     except Exception as e:
         position.order_id = _extract_order_id_from_error(e)
         position.submit_error = f"{type(e).__name__}: {e}"
+        position.extra["failure_kind"] = "submit_exception"
         position.submit_latency_ms = (time.perf_counter() - submit_started) * 1000.0
         if position.order_id:
             matched, avg, status, confirmed_no_fill = _confirm_no_fill(poly, position)
+            position.extra["confirmed_no_fill"] = confirmed_no_fill
             position.submit_status = status
             position.filled = matched > 0 and matched >= (decision.size or 0.0)
             position.partial = 0.0 < matched < (decision.size or 0.0)
@@ -285,7 +289,25 @@ def execute_entry(
             not _is_no_match_error(position.submit_error),
         )
         positions_mod.upsert_position(position)
-        logger.exception("submit_fak_buy failed for %s", window.slug)
+        if _is_no_match_error(position.submit_error):
+            logger.warning(
+                "submit_failed window=%s kind=no_match latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
+                window.slug,
+                position.submit_latency_ms or 0.0,
+                position.order_id or "-",
+                position.extra.get("consume_window_slot", True),
+                position.extra.get("confirmed_no_fill"),
+                position.submit_status or "-",
+            )
+        else:
+            logger.exception(
+                "submit_failed window=%s kind=exception latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s",
+                window.slug,
+                position.submit_latency_ms or 0.0,
+                position.order_id or "-",
+                position.extra.get("consume_window_slot", True),
+                position.extra.get("confirmed_no_fill"),
+            )
         return position
 
     position.submit_latency_ms = (time.perf_counter() - submit_started) * 1000.0
@@ -296,6 +318,7 @@ def execute_entry(
     avg = _extract_avg_price(resp) or decision.limit_price
     if matched <= 0.0 and position.order_id:
         matched, followup_avg, followup_status, confirmed_no_fill = _confirm_no_fill(poly, position)
+        position.extra["confirmed_no_fill"] = confirmed_no_fill
         if followup_status:
             position.submit_status = followup_status
         if followup_avg is not None:
@@ -315,9 +338,19 @@ def execute_entry(
     if not (position.filled or position.partial):
         position.status = positions_mod.STATUS_ENTRY_FAILED
         position.submit_error = position.submit_error or "fak_no_match"
+        position.extra["failure_kind"] = "no_match"
         position.extra["consume_window_slot"] = position.extra.get(
             "consume_window_slot",
             not _is_no_match_error(position.submit_error),
+        )
+        logger.warning(
+            "submit_failed window=%s kind=no_match latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
+            window.slug,
+            position.submit_latency_ms or 0.0,
+            position.order_id or "-",
+            position.extra.get("consume_window_slot", True),
+            position.extra.get("confirmed_no_fill"),
+            position.submit_status or "-",
         )
     else:
         # Fetch the live fee rate in the background path only; in the hot

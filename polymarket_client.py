@@ -381,6 +381,37 @@ class PolymarketClient:
     def get_fee_rate(self, token_id: str) -> float:
         return self.get_fee_rate_bps(token_id) / 10_000.0
 
+    def warm_up_live_trading(self) -> dict:
+        """Prime balance/allowance paths so the first live order is less surprising.
+
+        This intentionally avoids placing any order. It only touches the
+        collateral allowance/balance endpoints that the SDK commonly consults
+        on the first live submission.
+        """
+        summary = {
+            "balance_ok": False,
+            "collateral_allowance_refreshed": False,
+            "errors": [],
+        }
+        balance, details = self.get_usdc_balance_details()
+        if balance is not None:
+            summary["balance_ok"] = True
+            summary["balance_usd"] = balance
+        else:
+            summary["errors"].append(
+                f"balance_read_failed:{details.get('error', 'unknown')}"
+            )
+
+        try:
+            self.clob.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            summary["collateral_allowance_refreshed"] = True
+        except Exception as e:
+            summary["errors"].append(f"collateral_allowance_refresh_failed:{e}")
+
+        return summary
+
     def buy(self, token_id: str, price: float, size: float) -> dict:
         return self.clob.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
