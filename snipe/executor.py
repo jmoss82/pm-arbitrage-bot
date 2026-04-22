@@ -28,6 +28,9 @@ from .window import Window
 
 logger = logging.getLogger("snipe.executor")
 
+NO_MATCH_CONFIRM_RETRIES = 4
+NO_MATCH_CONFIRM_DELAY_S = 0.2
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -163,6 +166,26 @@ def _refresh_fill_state(
         return 0.0, None, position.submit_status
 
 
+def _confirm_no_fill(
+    poly: PolymarketClient,
+    position: positions_mod.SnipePosition,
+) -> tuple[float, Optional[float], Optional[str], bool]:
+    """Poll order state briefly before treating an apparent FAK miss as final."""
+    if not position.order_id:
+        return 0.0, None, position.submit_status, False
+
+    matched = 0.0
+    avg: Optional[float] = None
+    status = position.submit_status
+    for attempt in range(NO_MATCH_CONFIRM_RETRIES):
+        matched, avg, status = _refresh_fill_state(poly, position)
+        if matched > 0.0:
+            return matched, avg, status, False
+        if attempt < NO_MATCH_CONFIRM_RETRIES - 1:
+            time.sleep(NO_MATCH_CONFIRM_DELAY_S)
+    return matched, avg, status, True
+
+
 def execute_entry(
     poly: PolymarketClient,
     decision: EntryDecision,
@@ -234,7 +257,7 @@ def execute_entry(
         position.submit_error = f"{type(e).__name__}: {e}"
         position.submit_latency_ms = (time.perf_counter() - submit_started) * 1000.0
         if position.order_id:
-            matched, avg, status = _refresh_fill_state(poly, position)
+            matched, avg, status, confirmed_no_fill = _confirm_no_fill(poly, position)
             position.submit_status = status
             position.filled = matched > 0 and matched >= (decision.size or 0.0)
             position.partial = 0.0 < matched < (decision.size or 0.0)
@@ -255,8 +278,12 @@ def execute_entry(
                     position.entry_fee_usd = None
                 positions_mod.upsert_position(position)
                 return position
+            position.extra["consume_window_slot"] = not confirmed_no_fill
         position.status = positions_mod.STATUS_ENTRY_FAILED
-        position.extra["consume_window_slot"] = not _is_no_match_error(position.submit_error)
+        position.extra["consume_window_slot"] = position.extra.get(
+            "consume_window_slot",
+            not _is_no_match_error(position.submit_error),
+        )
         positions_mod.upsert_position(position)
         logger.exception("submit_fak_buy failed for %s", window.slug)
         return position
@@ -268,11 +295,12 @@ def execute_entry(
     matched = _extract_filled_size(resp) or 0.0
     avg = _extract_avg_price(resp) or decision.limit_price
     if matched <= 0.0 and position.order_id:
-        matched, followup_avg, followup_status = _refresh_fill_state(poly, position)
+        matched, followup_avg, followup_status, confirmed_no_fill = _confirm_no_fill(poly, position)
         if followup_status:
             position.submit_status = followup_status
         if followup_avg is not None:
             avg = followup_avg
+        position.extra["consume_window_slot"] = not confirmed_no_fill
     position.filled = matched > 0 and (decision.size or 0.0) > 0 and matched >= (decision.size or 0.0)
     position.partial = 0.0 < matched < (decision.size or 0.0)
     position.filled_size = matched if matched > 0 else 0.0
@@ -287,7 +315,10 @@ def execute_entry(
     if not (position.filled or position.partial):
         position.status = positions_mod.STATUS_ENTRY_FAILED
         position.submit_error = position.submit_error or "fak_no_match"
-        position.extra["consume_window_slot"] = not _is_no_match_error(position.submit_error)
+        position.extra["consume_window_slot"] = position.extra.get(
+            "consume_window_slot",
+            not _is_no_match_error(position.submit_error),
+        )
     else:
         # Fetch the live fee rate in the background path only; in the hot
         # loop this extra call is ~50-200ms and not worth the latency
