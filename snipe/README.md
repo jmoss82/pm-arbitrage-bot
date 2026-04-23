@@ -27,17 +27,18 @@ per-window entry cap) is the entire game.
 
 ```text
 snipe/
-├── __init__.py       Package marker + docstring
-├── README.md         This file
-├── config.py         All SNIPE_* env vars and defaults
-├── window.py         5-min window math + Gamma market discovery
-├── loop.py           Shared async scan loop (used by monitor and run)
-├── monitor.py        Read-only CSV logger (Phase 1)
-├── positions.py      SnipePosition dataclass + JSON persistence
-├── scanner.py        evaluate_tick() -- entry decision logic
-├── executor.py       FAK (Fill-And-Kill) order submission + dry-run sim
-├── settler.py        Gamma resolution poller + P&L
-└── main.py           argparse CLI: probe / status / monitor / run / ...
+├── __init__.py           Package marker + docstring
+├── README.md             This file
+├── config.py             All SNIPE_* env vars and defaults
+├── window.py             5-min window math + Gamma market discovery
+├── loop.py               Shared async scan loop (used by monitor and run)
+├── monitor.py            Read-only CSV logger (Phase 1)
+├── positions.py          SnipePosition dataclass + JSON persistence
+├── reference_price.py    Chainlink RTDS feed + ReferenceSnapshot
+├── scanner.py            evaluate_tick() -- entry decision logic
+├── executor.py           FAK (Fill-And-Kill) order submission + dry-run sim
+├── settler.py            Gamma resolution poller + P&L
+└── main.py               argparse CLI: probe / status / monitor / run / ...
 ```
 
 Data files live in `data/snipe/` (configurable via `SNIPE_DATA_DIR`):
@@ -141,6 +142,24 @@ read by snipe code.
 | `SNIPE_MIN_LEADER_PERSIST_TICKS` | `2` | Leader must stay leader for this many ticks |
 | `SNIPE_MIN_TOP_OF_BOOK_SIZE` | `10` | Minimum size at the leader's ask |
 
+### Chainlink reference-price gate
+Polymarket's Chainlink BTC/USD feed is exposed via the Real-Time Data
+Socket (`wss://ws-live-data.polymarket.com`, topic
+`crypto_prices_chainlink`, symbol `btc/usd`).  The scanner consults a
+live snapshot from that feed on every tick.  The "Price to Beat" is the
+first Chainlink tick at/after a window boundary; live distance is
+`current_price - price_to_beat`.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SNIPE_MIN_REF_DISTANCE_USD` | `25.0` | Minimum `|current - PTB|` in USD to allow an entry |
+| `SNIPE_REF_STALE_S` | `3.0` | Max age of the last live tick; older → refuse entry |
+| `SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT` | `true` | Book leader side must match sign(distance) |
+| `SNIPE_REQUIRE_REF_FEED` | `true` | When true, a missing/uninitialized snapshot hard-rejects |
+
+See section 6 for where these gates sit in the decision flow and what
+their reject reasons look like in the signals CSV.
+
 ### Sizing & budgets
 | Var | Default | Meaning |
 |---|---|---|
@@ -178,15 +197,38 @@ for you to abort (unless `--yes` is passed).
 `evaluate_tick()` in `scanner.py` applies gates in the following order.
 All must pass for an entry.
 
-1. **`window_full`** — per-window entry cap already reached
-2. **`daily_cap`** — today's cumulative spend already at or above daily cap
-3. **`open_position_cap`** — too many still-open positions
-4. **`no_leader`** — neither side has a clear best ask
-5. **`time_out_of_band`** — `seconds_remaining` outside `[min, max]`
-6. **`price_out_of_band`** — leader's best ask outside `[min, max]`
-7. **`thin_book`** — size at leader's best ask below floor
-8. **`leader_unstable`** — leader flipped during the last few ticks
-9. **`accept`** — all gates pass → `execute_entry`
+1. **`no_leader`** / **`no_ask_on_leader`** — neither side has a clear best ask
+2. **`ask_out_of_band`** — leader's best ask outside `[min, max]`
+3. **`too_early` / `too_late`** — `seconds_remaining` outside `[min, max]`
+4. **`thin_book`** — size at leader's best ask below floor
+5. **`leader_unstable`** — leader flipped during the last few ticks
+6. **Reference-price gate** (see section 5 "Chainlink reference-price gate"):
+   - **`ref_feed_missing`** — snapshot not initialized yet (cold start)
+   - **`ref_stale`** — last live tick older than `SNIPE_REF_STALE_S`
+   - **`ref_window_partial`** — feed joined mid-window; `price_to_beat` unknown
+   - **`ref_no_price_to_beat`** / **`ref_no_current_price`** / **`ref_no_distance`** — snapshot incomplete
+   - **`ref_slug_mismatch`** — book-derived slug and feed-derived slug disagree (boundary race)
+   - **`ref_too_close`** — `|current − price_to_beat| < SNIPE_MIN_REF_DISTANCE_USD`
+   - **`ref_disagree`** — book leader side disagrees with sign of distance
+7. **`window_entry_cap`** — per-window entry cap already reached
+8. **`max_open_positions`** — too many still-open positions
+9. **`daily_cap_hit`** — today's cumulative spend would exceed the daily cap
+10. **`accept`** — all gates pass → `execute_entry`
+
+### Why the reference-price gate matters
+
+The book alone is not enough.  A leader at $0.97 UP with 300+ size at
+the ask still loses if BTC is within a few dollars of the threshold
+when the final Chainlink tick lands.  Observed in a live dry-run:
+
+```
+t-4.0s  book UP 0.96/0.97  ref current=77773  PTB=77764  dist=+9$
+t-3.4s  book UP 0.89/0.97  ref current=77773  PTB=77764  dist=+9$
+t-2.8s  book DN 0.80/0.92  ref current=77719  PTB=77764  dist=-54$  (flipped)
+```
+
+A `SNIPE_MIN_REF_DISTANCE_USD=25` gate refuses the t-4.0s and t-3.4s
+entries (distance +9 < +25) and avoids the catastrophic flip.
 
 When accepted, the flow is:
 
@@ -262,8 +304,30 @@ total ticks seen, entries submitted, and the eventual resolved outcome.
 ### `btc5m_snipe_signals_*.csv`
 One row per scanner decision where the tick was in the neighborhood of
 the price or time bands.  Use this to audit why entries were or were not
-triggered.  Columns: `decision` ∈ {`accept`, `reject`, `accept_but_failed`}
-and `reason` (the failing gate name).
+triggered.
+
+Columns:
+
+| Column | Meaning |
+|---|---|
+| `ts_iso`, `window_slug`, `seconds_remaining` | When / which window / how far in |
+| `leader_side`, `leader_mid`, `leader_ask`, `leader_ask_size` | Book state |
+| `decision` | `accept`, `reject`, `enter`, or `accept_but_failed` |
+| `reason` | Failing-gate name (see section 6 for the full list) |
+| `ref_current_price` | Latest Chainlink tick, USD |
+| `ref_price_to_beat` | Window's opening Chainlink tick, USD (empty if partial) |
+| `ref_distance_usd`, `ref_distance_bps` | `current - PTB` in USD and basis points |
+| `ref_side` | `up` / `down` / `flat` derived from the distance sign |
+| `ref_window_slug`, `ref_window_partial` | Feed-derived window + partial flag |
+| `ref_age_ms` | Wall-clock age of the last live tick at decision time |
+| `position_id`, `dry_run` | Populated only on `enter` / `accept_but_failed` |
+
+This schema is designed for post-mortem calibration of
+`SNIPE_MIN_REF_DISTANCE_USD`: pull the CSV into pandas, filter to
+`decision == "reject"` AND `reason == "ref_too_close"`, and study the
+distribution of `ref_distance_usd` at `seconds_remaining < 10` against
+the eventual window outcome (from `windows_*.csv`).  Tune down the
+minimum distance once you have a few hundred data points.
 
 ### `positions.json`
 Durable list of every `SnipePosition` we've ever created (live or dry).
@@ -318,14 +382,19 @@ distribution of "time-to-settle" before making that change.
    are the Dockerfile defaults.  Live mode requires **both** env vars set.
 2. **FAK-only orders**: we cannot accidentally leave a resting limit order
    on Polymarket.
-3. **Per-window cap (default 1)**: even if the scanner fires repeatedly,
+3. **Chainlink reference-price gate**: entries are refused when BTC is
+   within `SNIPE_MIN_REF_DISTANCE_USD` of the window's Price to Beat,
+   when the feed is stale or partial, or when the book leader disagrees
+   with the oracle's implied side.  See section 6 and the dedicated
+   config section.  The gate is ON by default (`SNIPE_REQUIRE_REF_FEED=true`).
+4. **Per-window cap (default 1)**: even if the scanner fires repeatedly,
    we can't double up on a single window.
-4. **Daily spend cap**: caps blast radius of any mis-tuned session.
-5. **Restart safety**: attempt counters persist across process restarts
+5. **Daily spend cap**: caps blast radius of any mis-tuned session.
+6. **Restart safety**: attempt counters persist across process restarts
    via `positions.json` so Railway redeploys mid-window don't re-enter.
-6. **Settler grace period**: we never ask Gamma to resolve a market until
+7. **Settler grace period**: we never ask Gamma to resolve a market until
    90s past its close, to avoid spamming for in-limbo markets.
-7. **Balance preflight**: live mode refuses to start if USDC is unreadable
+8. **Balance preflight**: live mode refuses to start if USDC is unreadable
    or below `SNIPE_MIN_POLY_BALANCE_USD`.
 
 ---

@@ -17,6 +17,7 @@ from typing import Optional
 
 from . import config
 from .loop import Tick
+from .reference_price import ReferenceSnapshot
 from .window import Window
 
 
@@ -143,12 +144,21 @@ def evaluate_tick(
     tick: Tick,
     window: Window,
     session: SessionState,
+    ref: Optional[ReferenceSnapshot] = None,
 ) -> EntryDecision:
     """Evaluate a single tick against all entry gates.
 
     The order of checks matters for the telemetry story: the cheapest gates
     fire first so rejection reasons for common no-ops (price out of band,
     wrong time) dominate the rejection histogram over rarer reasons.
+
+    ``ref`` is the latest :class:`ReferenceSnapshot` from the Chainlink feed
+    (see ``snipe/reference_price.py``).  When provided, a distance gate is
+    applied: we refuse entries when BTC is too close to the window's Price
+    to Beat, when the feed is stale/partial, or when the book leader
+    disagrees with the oracle's implied side.  If ``ref`` is ``None`` and
+    ``config.SNIPE_REQUIRE_REF_FEED`` is True (the default), every tick is
+    rejected with ``ref_feed_missing`` -- this is the fail-closed posture.
     """
     session.maybe_reset_daily()
     leader_streak = session.observe_leader(window.slug, tick.leader_side)
@@ -177,6 +187,48 @@ def evaluate_tick(
             False,
             f"leader_unstable({leader_streak}/{config.SNIPE_MIN_LEADER_PERSIST_TICKS})",
         )
+
+    # ── Chainlink reference-price gate ──────────────────────────────
+    # This is the single most important change to prevent the class of
+    # losses where a $0.98 leader flipped by a $0.17 BTC move in the
+    # final second.  See snipe/reference_price.py for the feed design
+    # and the accompanying doc in README section "Reference-price gate".
+    if ref is None:
+        if config.SNIPE_REQUIRE_REF_FEED:
+            return EntryDecision(False, "ref_feed_missing")
+    else:
+        if not ref.is_fresh(config.SNIPE_REF_STALE_S):
+            return EntryDecision(False, "ref_stale")
+        if ref.window_partial:
+            return EntryDecision(False, "ref_window_partial")
+        if ref.price_to_beat is None:
+            return EntryDecision(False, "ref_no_price_to_beat")
+        if ref.current_price is None:
+            return EntryDecision(False, "ref_no_current_price")
+        # Defensive: the Chainlink feed and the book's window slug should
+        # agree.  They can desynchronize for a few hundred ms either side
+        # of a boundary (one crosses before the other).  In that narrow
+        # window, refuse to trade on mixed-window data.
+        if ref.window_slug and ref.window_slug != window.slug:
+            return EntryDecision(
+                False,
+                f"ref_slug_mismatch(ref={ref.window_slug},book={window.slug})",
+            )
+        distance = ref.distance_usd()
+        if distance is None:
+            return EntryDecision(False, "ref_no_distance")
+        if abs(distance) < config.SNIPE_MIN_REF_DISTANCE_USD:
+            return EntryDecision(
+                False,
+                f"ref_too_close(d={distance:+.2f},min={config.SNIPE_MIN_REF_DISTANCE_USD:.2f})",
+            )
+        if config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT:
+            implied = ref.implied_side()
+            if implied in ("up", "down") and implied != tick.leader_side:
+                return EntryDecision(
+                    False,
+                    f"ref_disagree(book={tick.leader_side},ref={implied},d={distance:+.2f})",
+                )
 
     entries_this_window = session.entries_this_window(window.slug)
     if entries_this_window >= config.SNIPE_MAX_ENTRIES_PER_WINDOW:

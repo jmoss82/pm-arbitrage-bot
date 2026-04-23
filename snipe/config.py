@@ -56,6 +56,46 @@ SNIPE_MIN_LEADER_PERSIST_TICKS = int(os.getenv("SNIPE_MIN_LEADER_PERSIST_TICKS",
 SNIPE_MIN_TOP_OF_BOOK_SIZE = float(os.getenv("SNIPE_MIN_TOP_OF_BOOK_SIZE", "10"))
 
 
+# ── Chainlink reference-price gate ──────────────────────────
+# Live distance between Polymarket's Chainlink BTC/USD feed and the
+# window's "Price to Beat" (the first Chainlink tick at/after the window
+# boundary).  Feeds into the scanner via snipe/reference_price.py.
+#
+# Losing trades observed pre-gate shared a common failure mode: the book
+# leader's ask was $0.97-0.99 (looked decisive) but BTC was only a few
+# dollars above/below the threshold in the final seconds, so a normal
+# 1-2s print flipped the outcome.  These gates refuse to enter when the
+# underlying reference is too close to the line, or when the feed cannot
+# be trusted (stale, partial window, disconnected).
+#
+# SNIPE_MIN_REF_DISTANCE_USD: minimum |current - PTB| in USD to allow an
+# entry.  $25 is ~3bps at $78k BTC -- comfortably above Chainlink tick
+# noise, so a window where the leader's ask is $0.98 AND BTC is within
+# $25 of PTB is rejected as a coinflip.  Tune down once calibrated.
+SNIPE_MIN_REF_DISTANCE_USD = float(os.getenv("SNIPE_MIN_REF_DISTANCE_USD", "25.0"))
+
+# SNIPE_REF_STALE_S: max age of the last observed live tick (seconds).
+# Chainlink emits several ticks per second on BTC.  Anything above ~2s
+# of silence indicates a connection problem; fail-closed by refusing
+# entries until the feed catches back up.
+SNIPE_REF_STALE_S = float(os.getenv("SNIPE_REF_STALE_S", "3.0"))
+
+# SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT: when True, entries are
+# refused unless the book leader's side matches the sign of
+# (current_price - price_to_beat).  E.g. book says UP leader but
+# current_price < price_to_beat -> reject.  This catches windows where
+# the book has lagged the oracle flip.
+SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT = _bool_env(
+    "SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT", "true"
+)
+
+# SNIPE_REQUIRE_REF_FEED: when True (default) the scanner treats absence
+# of a usable reference snapshot as a hard reject.  Set to False ONLY
+# for debugging runs where you explicitly want to observe the old gate
+# behavior without the distance check (e.g. comparing signal histograms).
+SNIPE_REQUIRE_REF_FEED = _bool_env("SNIPE_REQUIRE_REF_FEED", "true")
+
+
 # ── Sizing & budgets ────────────────────────────────────────
 SNIPE_POSITION_USD = float(os.getenv("SNIPE_POSITION_USD", "5.0"))
 SNIPE_MAX_ENTRIES_PER_WINDOW = int(os.getenv("SNIPE_MAX_ENTRIES_PER_WINDOW", "1"))

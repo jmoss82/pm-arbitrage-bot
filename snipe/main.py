@@ -47,6 +47,7 @@ from .monitor import (
     setup_csv_writers,
 )
 from .positions import SnipePosition
+from .reference_price import ReferencePriceFeed, ReferenceSnapshot
 from .scanner import SessionState, evaluate_tick
 from .settler import settle_open_positions
 from .window import (
@@ -138,6 +139,10 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         "max_entries_per_window": config.SNIPE_MAX_ENTRIES_PER_WINDOW,
         "max_spend_per_day_usd": config.SNIPE_MAX_SPEND_PER_DAY_USD,
         "max_open_positions": config.SNIPE_MAX_OPEN_POSITIONS,
+        "ref_min_distance_usd": config.SNIPE_MIN_REF_DISTANCE_USD,
+        "ref_stale_s": config.SNIPE_REF_STALE_S,
+        "ref_require_directional_agreement": config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT,
+        "ref_required": config.SNIPE_REQUIRE_REF_FEED,
         "dry_run": config.SNIPE_DRY_RUN,
         "enable_live": config.SNIPE_ENABLE_LIVE,
         "live_armed": config.snipe_live_mode_requested(),
@@ -226,6 +231,14 @@ TRADE_SIGNAL_FIELDS = [
     "leader_ask_size",
     "decision",
     "reason",
+    "ref_current_price",
+    "ref_price_to_beat",
+    "ref_distance_usd",
+    "ref_distance_bps",
+    "ref_side",
+    "ref_window_slug",
+    "ref_window_partial",
+    "ref_age_ms",
     "position_id",
     "dry_run",
 ]
@@ -240,14 +253,51 @@ def _append_signal_row(path: Path, row: dict) -> None:
         w.writerow(row)
 
 
+def _ref_row_fields(ref: Optional[ReferenceSnapshot], at: datetime) -> dict:
+    """Flatten a reference snapshot into the signal-row schema.
+
+    Always returns every ``ref_*`` key so CSV writer sees a full dict.
+    Missing values are empty strings so downstream `pandas.read_csv`
+    behaves (empty -> NaN) rather than mixing `None` and float in the
+    same column.
+    """
+    if ref is None:
+        return {
+            "ref_current_price": "",
+            "ref_price_to_beat": "",
+            "ref_distance_usd": "",
+            "ref_distance_bps": "",
+            "ref_side": "",
+            "ref_window_slug": "",
+            "ref_window_partial": "",
+            "ref_age_ms": "",
+        }
+    d_usd = ref.distance_usd()
+    d_bps = ref.distance_bps()
+    age_ms = ""
+    if ref.last_tick_recv_utc is not None:
+        age_ms = f"{(at - ref.last_tick_recv_utc).total_seconds() * 1000.0:.0f}"
+    return {
+        "ref_current_price": "" if ref.current_price is None else f"{ref.current_price:.2f}",
+        "ref_price_to_beat": "" if ref.price_to_beat is None else f"{ref.price_to_beat:.2f}",
+        "ref_distance_usd": "" if d_usd is None else f"{d_usd:+.2f}",
+        "ref_distance_bps": "" if d_bps is None else f"{d_bps:+.3f}",
+        "ref_side": ref.implied_side() or "",
+        "ref_window_slug": ref.window_slug or "",
+        "ref_window_partial": "" if ref.window_slug == "" else str(bool(ref.window_partial)).lower(),
+        "ref_age_ms": age_ms,
+    }
+
+
 def _signal_row_from(
     ctx: LoopContext,
     decision_label: str,
     reason: str,
     position: Optional[SnipePosition],
+    ref: Optional[ReferenceSnapshot] = None,
 ) -> dict:
     t = ctx.tick
-    return {
+    base = {
         "ts_iso": t.ts_utc.isoformat(),
         "window_slug": t.window_slug,
         "seconds_remaining": f"{t.seconds_remaining:.2f}",
@@ -260,20 +310,29 @@ def _signal_row_from(
         "position_id": position.id if position else "",
         "dry_run": str(position.dry_run).lower() if position else "",
     }
+    base.update(_ref_row_fields(ref, t.ts_utc))
+    return base
 
 
 def make_scanner_handler(
     session_state: SessionState,
     dry_run: bool,
     signal_csv: Path,
+    ref_feed: Optional[ReferencePriceFeed] = None,
 ):
     """
     Tick handler that consults the scanner and invokes the executor on
     accepted entries.  All signals (accepted and rejected) are logged to
     ``signal_csv`` so we can post-mortem the rejection distribution.
+
+    If ``ref_feed`` is provided, its latest snapshot is passed into
+    ``evaluate_tick`` so the scanner can apply the Chainlink distance
+    gate.  The same snapshot is recorded verbatim on every logged signal
+    row for offline calibration.
     """
     async def _handler(ctx: LoopContext) -> None:
-        decision = evaluate_tick(ctx.tick, ctx.window, session_state)
+        ref_snap = ref_feed.snapshot() if ref_feed is not None else None
+        decision = evaluate_tick(ctx.tick, ctx.window, session_state, ref=ref_snap)
 
         if not decision.should_enter:
             # Only log "interesting" rejects to keep the file small.  A
@@ -293,7 +352,7 @@ def make_scanner_handler(
             if near_price or near_time:
                 _append_signal_row(
                     signal_csv,
-                    _signal_row_from(ctx, "reject", decision.reason, None),
+                    _signal_row_from(ctx, "reject", decision.reason, None, ref=ref_snap),
                 )
             return
 
@@ -318,7 +377,10 @@ def make_scanner_handler(
                 session_state.release_attempt(ctx.window.slug)
             _append_signal_row(
                 signal_csv,
-                _signal_row_from(ctx, "accept_but_failed", position.submit_error or "", position),
+                _signal_row_from(
+                    ctx, "accept_but_failed",
+                    position.submit_error or "", position, ref=ref_snap,
+                ),
             )
             latency = position.submit_latency_ms or 0.0
             retry_note = (
@@ -338,7 +400,10 @@ def make_scanner_handler(
 
         session_state.register_fill(position.entry_cost_usd or 0.0)
         ctx.acc.entries_submitted += 1
-        _append_signal_row(signal_csv, _signal_row_from(ctx, "enter", decision.reason, position))
+        _append_signal_row(
+            signal_csv,
+            _signal_row_from(ctx, "enter", decision.reason, position, ref=ref_snap),
+        )
 
         tag = "DRY" if dry_run else "LIVE"
         if position.avg_fill_price is not None:
@@ -473,20 +538,40 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         out(f"  Restored attempt counters for {len(session_state.entries_by_window)} "
             f"recent window(s) from positions.json")
 
-    await run_window_loop(
-        poly,
-        on_tick=[
-            make_scanner_handler(session_state, dry_run, signal_csv),
-            make_tick_csv_handler(ticks_path),
-            make_tty_handler(),
-            make_settler_handler(),
-        ],
-        on_window_end=[
-            make_window_csv_handler(windows_path),
-        ],
-        on_new_window=make_new_window_announcer(),
-        duration_minutes=args.duration,
+    # Spin up the Chainlink reference-price feed.  Every scanner tick
+    # reads its latest snapshot; entries are refused when the snapshot
+    # is missing, stale, partial, or too close to the threshold.  See
+    # snipe/reference_price.py and the "Reference-price gate" section
+    # of snipe/README.md.
+    ref_feed = ReferencePriceFeed(
+        on_event=lambda ev, detail: out(f"  [ref] {ev} {detail if detail is not None else ''}"),
     )
+    ref_feed.start()
+    out("  [ref] Chainlink RTDS feed starting (required for entries)")
+    out(f"         min distance: ${config.SNIPE_MIN_REF_DISTANCE_USD:.2f}  "
+        f"stale cutoff: {config.SNIPE_REF_STALE_S:.1f}s  "
+        f"directional: {config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT}")
+    out()
+
+    try:
+        await run_window_loop(
+            poly,
+            on_tick=[
+                make_scanner_handler(session_state, dry_run, signal_csv, ref_feed=ref_feed),
+                make_tick_csv_handler(ticks_path),
+                make_tty_handler(),
+                make_settler_handler(),
+            ],
+            on_window_end=[
+                make_window_csv_handler(windows_path),
+            ],
+            on_new_window=make_new_window_announcer(),
+            duration_minutes=args.duration,
+        )
+    finally:
+        out()
+        out("  [ref] stopping Chainlink feed...")
+        await ref_feed.stop()
 
     out()
     out("  Final settlement sweep...")
