@@ -308,8 +308,8 @@ def execute_entry(
         )
         positions_mod.upsert_position(position)
         if _is_no_match_error(position.submit_error):
-            logger.warning(
-                "submit_failed window=%s kind=no_match latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
+            logger.info(
+                "submit_no_match window=%s latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
                 window.slug,
                 position.submit_latency_ms or 0.0,
                 position.order_id or "-",
@@ -359,8 +359,8 @@ def execute_entry(
             "consume_window_slot",
             not _is_no_match_error(position.submit_error),
         )
-        logger.warning(
-            "submit_failed window=%s kind=no_match latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
+        logger.info(
+            "submit_no_match window=%s latency_ms=%.0f order_id=%s consume_window_slot=%s confirmed_no_fill=%s status=%s",
             window.slug,
             position.submit_latency_ms or 0.0,
             position.order_id or "-",
