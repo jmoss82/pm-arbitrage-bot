@@ -474,11 +474,13 @@ class PolymarketClient:
         status = str(order.get("status", "")).lower()
         avg_price = self._extract_float_field(
             order,
-            ["average_price", "averagePrice", "avg_price", "price"],
+            ["average_price", "averagePrice", "avg_price"],
         )
         matched_size = self._extract_float_field(
             order,
             [
+                "takingAmount",
+                "taking_amount",
                 "size_matched",
                 "matchedSize",
                 "filled_size",
@@ -494,6 +496,8 @@ class PolymarketClient:
             filled_value = self._extract_float_field(
                 order,
                 [
+                    "makingAmount",
+                    "making_amount",
                     "filled_amount",
                     "filledAmount",
                     "matched_amount",
@@ -503,6 +507,13 @@ class PolymarketClient:
             )
             if filled_value is not None and avg_price and avg_price > 0:
                 matched_size = filled_value / avg_price
+        else:
+            filled_value = self._extract_float_field(
+                order,
+                ["makingAmount", "making_amount", "filled_value", "filledValue"],
+            )
+            if avg_price is None and filled_value is not None and matched_size > 0:
+                avg_price = filled_value / matched_size
 
         return {
             "status": status or None,

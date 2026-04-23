@@ -128,6 +128,10 @@ def _extract_filled_size(resp: dict | None) -> Optional[float]:
 def _extract_avg_price(resp: dict | None) -> Optional[float]:
     if not isinstance(resp, dict):
         return None
+    making = _extract_response_amount(resp, ("makingAmount", "making_amount"))
+    taking = _extract_response_amount(resp, ("takingAmount", "taking_amount"))
+    if making is not None and taking and taking > 0:
+        return making / taking
     for key in ("average_price", "averagePrice", "avg_price"):
         v = resp.get(key)
         if v is not None:
@@ -135,6 +139,20 @@ def _extract_avg_price(resp: dict | None) -> Optional[float]:
                 return float(v)
             except (TypeError, ValueError):
                 continue
+    return None
+
+
+def _extract_response_amount(resp: dict | None, keys: tuple[str, ...]) -> Optional[float]:
+    if not isinstance(resp, dict):
+        return None
+    for key in keys:
+        v = resp.get(key)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
     return None
 
 
@@ -314,9 +332,13 @@ def execute_entry(
     position.submit_status = _extract_status(resp)
     position.order_id = _extract_order_id(resp)
 
-    matched = _extract_filled_size(resp) or 0.0
-    avg = _extract_avg_price(resp) or decision.limit_price
-    if matched <= 0.0 and position.order_id:
+    matched = (
+        _extract_response_amount(resp, ("takingAmount", "taking_amount"))
+        or _extract_filled_size(resp)
+        or 0.0
+    )
+    avg = _extract_avg_price(resp)
+    if (matched <= 0.0 or avg is None) and position.order_id:
         matched, followup_avg, followup_status, confirmed_no_fill = _confirm_no_fill(poly, position)
         position.extra["confirmed_no_fill"] = confirmed_no_fill
         if followup_status:
