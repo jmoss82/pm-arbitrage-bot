@@ -21,6 +21,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 
 from polymarket_client import PolymarketClient
 
+from . import config
 from . import positions as positions_mod
 from .loop import Tick
 from .scanner import EntryDecision
@@ -58,6 +59,42 @@ def submit_fak_buy(
     args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
     signed = poly.clob.create_order(args)
     return poly.clob.post_order(signed, orderType=OrderType.FAK)
+
+
+def _level_value(level, key: str) -> Optional[float]:
+    value = getattr(level, key, None)
+    if value is None and isinstance(level, dict):
+        value = level.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_best_ask(
+    poly: PolymarketClient,
+    token_id: str,
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """Read the raw current best ask without midpoint fallback."""
+    try:
+        book = poly.get_orderbook(token_id)
+        asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    best_price: Optional[float] = None
+    best_size: Optional[float] = None
+    for level in asks or []:
+        price = _level_value(level, "price")
+        if price is None:
+            continue
+        size = _level_value(level, "size")
+        if best_price is None or price < best_price:
+            best_price = price
+            best_size = size
+    return best_price, best_size, None
 
 
 def _extract_order_id(resp: dict | None) -> Optional[str]:
@@ -271,6 +308,62 @@ def execute_entry(
     # Live path -- hot code.  Everything up to the submit should have
     # happened on the caller's clock; we only measure the submit round-trip
     # here and store it for calibration.
+    min_presubmit_ask = config.SNIPE_PRESUBMIT_MIN_ASK_PRICE
+    if min_presubmit_ask > 0:
+        ask, ask_size, read_error = _read_best_ask(
+            poly,
+            decision.token_id,  # type: ignore[arg-type]
+        )
+        position.extra["presubmit_best_ask"] = ask
+        position.extra["presubmit_best_ask_size"] = ask_size
+        position.extra["presubmit_min_ask_price"] = min_presubmit_ask
+        if read_error is not None:
+            position.status = positions_mod.STATUS_ENTRY_FAILED
+            position.submit_error = f"pre_submit_book_read_failed({read_error})"
+            position.extra["failure_kind"] = "pre_submit_guard"
+            position.extra["consume_window_slot"] = False
+            positions_mod.upsert_position(position)
+            logger.info(
+                "pre_submit_guard_read_failed window=%s token=%s error=%s",
+                window.slug,
+                str(decision.token_id)[:12],
+                read_error,
+            )
+            return position
+        if ask is None:
+            position.status = positions_mod.STATUS_ENTRY_FAILED
+            position.submit_error = "pre_submit_no_ask"
+            position.extra["failure_kind"] = "pre_submit_guard"
+            position.extra["consume_window_slot"] = False
+            positions_mod.upsert_position(position)
+            logger.info(
+                "pre_submit_guard_no_ask window=%s token=%s requested_price=%.4f",
+                window.slug,
+                str(decision.token_id)[:12],
+                decision.limit_price or 0.0,
+            )
+            return position
+        if ask < min_presubmit_ask:
+            position.status = positions_mod.STATUS_ENTRY_FAILED
+            position.submit_error = (
+                f"pre_submit_ask_below_floor(ask={ask:.4f},min={min_presubmit_ask:.4f})"
+            )
+            position.extra["failure_kind"] = "pre_submit_guard"
+            # Treat a collapse below the floor as a bad regime for the window.
+            position.extra["consume_window_slot"] = True
+            positions_mod.upsert_position(position)
+            logger.info(
+                "pre_submit_guard_blocked window=%s token=%s requested_price=%.4f "
+                "current_ask=%.4f current_size=%s floor=%.4f",
+                window.slug,
+                str(decision.token_id)[:12],
+                decision.limit_price or 0.0,
+                ask,
+                "-" if ask_size is None else f"{ask_size:.2f}",
+                min_presubmit_ask,
+            )
+            return position
+
     submit_started = time.perf_counter()
     try:
         resp = submit_fak_buy(

@@ -143,6 +143,7 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         "ref_stale_s": config.SNIPE_REF_STALE_S,
         "ref_require_directional_agreement": config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT,
         "ref_required": config.SNIPE_REQUIRE_REF_FEED,
+        "presubmit_min_ask_price": config.SNIPE_PRESUBMIT_MIN_ASK_PRICE,
         "dry_run": config.SNIPE_DRY_RUN,
         "enable_live": config.SNIPE_ENABLE_LIVE,
         "live_armed": config.snipe_live_mode_requested(),
@@ -393,9 +394,15 @@ def make_scanner_handler(
                 if "confirmed_no_fill" in position.extra
                 else ""
             )
-            out(f"  !! entry FAILED for {ctx.tick.window_slug} "
-                f"({position.submit_error}) after {latency:.0f}ms -- "
-                f"{retry_note}{confirm_note}")
+            if position.extra.get("failure_kind") == "pre_submit_guard":
+                out(
+                    f"  -- entry SKIPPED for {ctx.tick.window_slug} "
+                    f"({position.submit_error}) -- {retry_note}"
+                )
+            else:
+                out(f"  !! entry FAILED for {ctx.tick.window_slug} "
+                    f"({position.submit_error}) after {latency:.0f}ms -- "
+                    f"{retry_note}{confirm_note}")
             return
 
         session_state.register_fill(position.entry_cost_usd or 0.0)

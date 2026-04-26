@@ -96,6 +96,17 @@ SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT = _bool_env(
 SNIPE_REQUIRE_REF_FEED = _bool_env("SNIPE_REQUIRE_REF_FEED", "true")
 
 
+# ── Pre-submit book guard ───────────────────────────────────
+# Re-read the live CLOB book immediately before submitting a FAK order.
+# A large "favorable" move between signal and submit (e.g. signal at 0.98,
+# live ask now 0.74) is usually adverse selection in the final seconds, not
+# a bargain.  Refuse the entry if the current ask has collapsed below this
+# floor.  Set to 0 to disable.
+SNIPE_PRESUBMIT_MIN_ASK_PRICE = float(
+    os.getenv("SNIPE_PRESUBMIT_MIN_ASK_PRICE", "0.90")
+)
+
+
 # ── Sizing & budgets ────────────────────────────────────────
 SNIPE_POSITION_USD = float(os.getenv("SNIPE_POSITION_USD", "5.0"))
 SNIPE_MAX_ENTRIES_PER_WINDOW = int(os.getenv("SNIPE_MAX_ENTRIES_PER_WINDOW", "1"))

@@ -160,6 +160,11 @@ first Chainlink tick at/after a window boundary; live distance is
 See section 6 for where these gates sit in the decision flow and what
 their reject reasons look like in the signals CSV.
 
+### Pre-submit book guard
+| Var | Default | Meaning |
+|---|---|---|
+| `SNIPE_PRESUBMIT_MIN_ASK_PRICE` | `0.90` | Immediately before a live FAK submit, re-read the raw best ask for the chosen token and abort if it has collapsed below this floor; set `0` to disable |
+
 ### Sizing & budgets
 | Var | Default | Meaning |
 |---|---|---|
@@ -214,6 +219,12 @@ All must pass for an entry.
 8. **`max_open_positions`** — too many still-open positions
 9. **`daily_cap_hit`** — today's cumulative spend would exceed the daily cap
 10. **`accept`** — all gates pass → `execute_entry`
+
+`execute_entry()` applies one final live-only guard before sending the FAK:
+it re-reads the raw CLOB best ask for the selected token and refuses the
+entry if that ask is below `SNIPE_PRESUBMIT_MIN_ASK_PRICE`.  This catches the
+adverse-selection pattern where a $0.98 signal collapses to a $0.70-$0.80
+fill during the submit round trip.
 
 ### Why the reference-price gate matters
 
