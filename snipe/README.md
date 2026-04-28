@@ -97,7 +97,7 @@ Always run from the **repo root** (not from `snipe/`):
 ```bash
 python -m snipe.main probe                    # verify slug resolves to a real market
 python -m snipe.main status                   # dump effective config as JSON
-python -m snipe.main preflight                # check USDC + arming state
+python -m snipe.main preflight                # check pUSD + arming state
 python -m snipe.main monitor                  # read-only logger (runs forever)
 python -m snipe.main monitor --duration 10    # read-only logger (10 minutes)
 python -m snipe.main run                      # scanner + executor (DRY-RUN by default)
@@ -178,8 +178,8 @@ their reject reasons look like in the signals CSV.
 |---|---|---|
 | `SNIPE_DRY_RUN` | `true` | Simulate orders; do not submit |
 | `SNIPE_ENABLE_LIVE` | `false` | Required in addition to `SNIPE_DRY_RUN=false` to go live |
-| `SNIPE_REQUIRE_BALANCE_CHECK` | `true` | Block live start if USDC balance unreadable |
-| `SNIPE_MIN_POLY_BALANCE_USD` | `10.0` | Refuse to start live if USDC below this |
+| `SNIPE_REQUIRE_BALANCE_CHECK` | `true` | Block live start if pUSD balance unreadable |
+| `SNIPE_MIN_POLY_BALANCE_USD` | `10.0` | Refuse to start live if pUSD below this |
 
 ### Storage
 | Var | Default | Meaning |
@@ -405,7 +405,7 @@ distribution of "time-to-settle" before making that change.
    via `positions.json` so Railway redeploys mid-window don't re-enter.
 7. **Settler grace period**: we never ask Gamma to resolve a market until
    90s past its close, to avoid spamming for in-limbo markets.
-8. **Balance preflight**: live mode refuses to start if USDC is unreadable
+8. **Balance preflight**: live mode refuses to start if pUSD is unreadable
    or below `SNIPE_MIN_POLY_BALANCE_USD`.
 
 ---

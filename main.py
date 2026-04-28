@@ -863,7 +863,7 @@ async def cmd_status(args):
     try:
         poly = PolymarketClient()
         usdc = poly.get_usdc_balance()
-        print(f"  USDC Balance: ${usdc:.2f}" if usdc is not None else "  Balance: unavailable")
+        print(f"  pUSD Balance: ${usdc:.2f}" if usdc is not None else "  Balance: unavailable")
         async with aiohttp.ClientSession() as session:
             positions = await PolymarketClient.fetch_positions(session, config.POLY_FUNDER)
         active = [p for p in positions if float(p.get("size", 0)) > 0.01]

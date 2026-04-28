@@ -9,13 +9,12 @@ from dataclasses import dataclass, field
 
 import aiohttp
 import requests
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2 import (
+    ClobClient,
     ApiCreds,
     OrderArgs,
     BalanceAllowanceParams,
     AssetType,
-    OrderType,
 )
 
 import config
@@ -130,7 +129,10 @@ class PolymarketClient:
                 key=config.POLY_PRIVATE_KEY,
                 signature_type=2,
             )
-            raw_creds = l1_client.derive_api_key()
+            if hasattr(l1_client, "create_or_derive_api_key"):
+                raw_creds = l1_client.create_or_derive_api_key()
+            else:
+                raw_creds = l1_client.derive_api_key()
 
             if isinstance(raw_creds, dict):
                 api_key = raw_creds.get("apiKey") or raw_creds.get("api_key")
@@ -229,7 +231,7 @@ class PolymarketClient:
             logger.debug("Fetched page %d: %d markets (total %d)", page, len(batch), len(all_markets))
         return all_markets
 
-    # ── Order Book (CLOB — sync, via py_clob_client) ─────────────────────
+    # ── Order Book (CLOB — sync, via py_clob_client_v2) ──────────────────
 
     def get_orderbook(self, token_id: str) -> dict:
         """Fetch CLOB order book for a given token_id. Returns raw dict."""
@@ -385,7 +387,7 @@ class PolymarketClient:
         """Prime balance/allowance paths so the first live order is less surprising.
 
         This intentionally avoids placing any order. It only touches the
-        collateral allowance/balance endpoints that the SDK commonly consults
+        pUSD collateral allowance/balance endpoints that the SDK commonly consults
         on the first live submission.
         """
         summary = {
@@ -440,7 +442,7 @@ class PolymarketClient:
             logger.debug("update_balance_allowance(CONDITIONAL) for %s: %s", token_id[:12], e)
 
     def cancel(self, order_id: str):
-        return self.clob.cancel(order_id)
+        return self.clob.cancel_order(order_id)
 
     def get_order(self, order_id: str) -> dict:
         return self.clob.get_order(order_id)
@@ -543,7 +545,11 @@ class PolymarketClient:
     # ── Balance / Positions ──────────────────────────────────────────────
 
     def get_usdc_balance_details(self) -> tuple[float | None, dict]:
-        """Return parsed USDC balance plus safe diagnostics about the query."""
+        """Return parsed pUSD collateral balance plus safe diagnostics.
+
+        The method name is kept for compatibility with existing callers from
+        the pre-V2 USDC.e integration.
+        """
         details = {
             "funder": _mask_value(config.POLY_FUNDER),
             "host": config.CLOB_HOST,
@@ -560,11 +566,11 @@ class PolymarketClient:
             return None, details
         except Exception as e:
             details["error"] = str(e)
-            logger.warning("Failed to get USDC balance for funder %s: %s", details["funder"], e)
+            logger.warning("Failed to get pUSD balance for funder %s: %s", details["funder"], e)
             return None, details
 
     def get_usdc_balance(self) -> float | None:
-        """Return USDC balance in human units."""
+        """Return pUSD collateral balance in human units."""
         balance, _ = self.get_usdc_balance_details()
         return balance
 

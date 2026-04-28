@@ -7,7 +7,7 @@ Subcommands:
     status        Print effective configuration and arming state.
     monitor       Run the read-only research logger.
     run           Run the live scanner + executor loop (dry-run by default).
-    preflight     Check USDC balance and live-arming state.
+    preflight     Check pUSD balance and live-arming state.
     positions     List open + recent settled positions.
     settle        Query Gamma to resolve outstanding positions.
 
@@ -172,9 +172,9 @@ async def _cmd_monitor(args: argparse.Namespace) -> int:
 async def _cmd_preflight(args: argparse.Namespace) -> int:
     """
     Report balance + arming state.  This does NOT trigger the on-chain
-    USDC allowance approval on its own -- the Polymarket SDK handles that
+    pUSD allowance approval on its own -- the Polymarket SDK handles that
     transparently on first order.  The point of preflight is to catch
-    misconfiguration (missing key, insufficient USDC, wrong env) before
+    misconfiguration (missing key, insufficient pUSD, wrong env) before
     we ever get near a live order submission.
     """
     out("  Preflight checks")
@@ -198,10 +198,10 @@ async def _cmd_preflight(args: argparse.Namespace) -> int:
         out(f"  [FAIL] get_usdc_balance: {e}")
         return 1
     if usdc is None:
-        out("  [FAIL] USDC balance returned None")
+        out("  [FAIL] pUSD balance returned None")
         return 1
 
-    out(f"  [ok] USDC balance: ${usdc:.4f}")
+    out(f"  [ok] pUSD balance: ${usdc:.4f}")
 
     ok = True
     min_bal = config.SNIPE_MIN_POLY_BALANCE_USD
@@ -487,16 +487,16 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         try:
             usdc = poly.get_usdc_balance()
         except Exception as e:
-            out(f"  [FAIL] preflight USDC read: {e}")
+            out(f"  [FAIL] preflight pUSD read: {e}")
             return 2
         if usdc is None or (
             config.SNIPE_REQUIRE_BALANCE_CHECK
             and usdc < config.SNIPE_MIN_POLY_BALANCE_USD
         ):
-            out(f"  [FAIL] USDC ${usdc} below SNIPE_MIN_POLY_BALANCE_USD "
+            out(f"  [FAIL] pUSD ${usdc} below SNIPE_MIN_POLY_BALANCE_USD "
                 f"(${config.SNIPE_MIN_POLY_BALANCE_USD:.2f})")
             return 2
-        out(f"  [ok] USDC ${usdc:.2f}")
+        out(f"  [ok] pUSD ${usdc:.2f}")
         out("  Warming live order path...")
         try:
             warm = poly.warm_up_live_trading()

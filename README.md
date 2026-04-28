@@ -166,7 +166,7 @@ Core arbitrage settings in `.env`:
 | `ARB_ENABLE_LIVE` | `false` | Additional hard gate. Live only allowed when this is true |
 | `ARB_REQUIRE_BALANCE_CHECK` | `true` | Enforce account balance checks before live trading |
 | `ARB_MIN_KALSHI_BALANCE_USD` | `25.0` | Minimum Kalshi cash required for live preflight |
-| `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket USDC required for live preflight |
+| `ARB_MIN_POLY_BALANCE_USD` | `25.0` | Minimum Polymarket pUSD required for live preflight |
 | `ARB_MAX_OPEN_POSITIONS` | `1` | Cap concurrent open arb positions |
 
 ### BTC 15-minute entry controls

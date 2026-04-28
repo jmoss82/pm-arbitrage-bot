@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client_v2 import OrderArgs, OrderType
 
 from polymarket_client import PolymarketClient
 
@@ -58,7 +58,7 @@ def submit_fak_buy(
     """
     args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
     signed = poly.clob.create_order(args)
-    return poly.clob.post_order(signed, orderType=OrderType.FAK)
+    return poly.clob.post_order(signed, order_type=OrderType.FAK)
 
 
 def _level_value(level, key: str) -> Optional[float]:

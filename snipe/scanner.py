@@ -106,9 +106,9 @@ class SessionState:
 
 
 def _compute_size(position_usd: float, price: float) -> float:
-    """Compute a share count whose USDC cost is exactly 2-decimal accurate.
+    """Compute a share count whose pUSD cost is exactly 2-decimal accurate.
 
-    Polymarket's CLOB rejects BUY orders whose maker amount (USDC) has more
+    Polymarket's CLOB rejects BUY orders whose maker amount (pUSD) has more
     than 2 decimals of precision -- see PolyApiException "invalid amounts,
     the market buy orders maker amount supports a max accuracy of 2 decimals".
     A naive ``round(usd / price, 2)`` does not satisfy this (e.g. 5.10 * 0.98
