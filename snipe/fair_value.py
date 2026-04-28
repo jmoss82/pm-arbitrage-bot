@@ -40,6 +40,30 @@ FV_FIELDS = [
 ]
 
 
+CALIBRATION_FIELDS = [
+    "ts_iso",
+    "window_slug",
+    "kind",
+    "seconds_remaining",
+    "distance_usd",
+    "expected_move_usd",
+    "sigma_usd_per_sqrt_s",
+    "p_up",
+    "p_down",
+    "up_ask",
+    "up_ask_size",
+    "up_edge",
+    "down_ask",
+    "down_ask_size",
+    "down_edge",
+    "total_mid",
+    "leader_side",
+    "resolved_side",
+    "final_up_mid",
+    "final_down_mid",
+]
+
+
 @dataclass(frozen=True)
 class FairValueEstimate:
     p_up: float
@@ -67,6 +91,21 @@ class ShadowSignal:
 
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _fmt_opt(value: object, spec: str) -> str:
+    if value is None:
+        return ""
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _fmt_signed(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    return f"{value:+.4f}"
 
 
 class FairValueModel:
@@ -147,9 +186,11 @@ class FairValueShadowTracker:
         ref_feed: ReferencePriceFeed,
         csv_path: Path,
         out: Callable[[str], None],
+        calibration_path: Optional[Path] = None,
     ) -> None:
         self._ref_feed = ref_feed
         self._csv_path = csv_path
+        self._calibration_path = calibration_path
         self._out = out
         self._model = FairValueModel(
             lookback_s=config.SNIPE_FV_VOL_LOOKBACK_S,
@@ -173,7 +214,12 @@ class FairValueShadowTracker:
             ">=0.95": 0,
         }
         self._last_summary_at = 0.0
+        self._calibration_rows = 0
+        self._calibrated_windows: set[str] = set()
+        self._last_calibration_at: dict[str, float] = {}
         self._init_csv()
+        if self._calibration_path is not None:
+            self._init_calibration_csv()
 
     async def on_tick(self, ctx: LoopContext) -> None:
         if not config.SNIPE_FV_SHADOW_ENABLED:
@@ -201,6 +247,8 @@ class FairValueShadowTracker:
         if estimate is None:
             return
 
+        self._maybe_log_calibration(ctx, estimate)
+
         signal = self._best_signal(ctx, estimate)
         if signal is None:
             self._maybe_print_summary()
@@ -227,18 +275,21 @@ class FairValueShadowTracker:
         self._windows_seen.add(acc.window.slug)
         if acc.window.slug in self._settled_windows:
             return
-        signal = self._signals_by_window.get(acc.window.slug)
-        if signal is None:
-            self._maybe_print_summary(force=True)
-            return
         if datetime.now(timezone.utc) < acc.window.end:
             self._maybe_print_summary(force=True)
             return
         if acc.last_tick is None or acc.last_tick.leader_side not in ("up", "down"):
             return
 
-        self._settled_windows.add(acc.window.slug)
         resolved = acc.last_tick.leader_side
+        self._log_calibration_close(acc, resolved)
+
+        signal = self._signals_by_window.get(acc.window.slug)
+        if signal is None:
+            self._maybe_print_summary(force=True)
+            return
+
+        self._settled_windows.add(acc.window.slug)
         won = signal.side == resolved
         if won:
             self._wins += 1
@@ -256,18 +307,23 @@ class FairValueShadowTracker:
         self.print_summary(force=True)
 
     def print_summary(self, *, force: bool = False) -> None:
-        if not force and self._signals == 0:
+        if not force and self._signals == 0 and self._calibration_rows == 0:
             return
         settled = self._wins + self._losses
         win_rate = (self._wins / settled * 100.0) if settled else 0.0
         avg_edge = self._edge_sum / self._signals if self._signals else 0.0
         avg_entry = self._entry_price_sum / self._signals if self._signals else 0.0
+        calib_part = (
+            f" calib_rows={self._calibration_rows}"
+            if self._calibration_path is not None
+            else ""
+        )
         self._out(
             "  [fv] summary "
             f"windows={len(self._windows_seen)} signals={self._signals} settled={settled} "
             f"wins={self._wins} losses={self._losses} "
             f"win_rate={win_rate:.1f}% avg_entry={avg_entry:.3f} "
-            f"avg_edge={avg_edge:+.3f} paper_pnl={self._paper_pnl:+.2f}"
+            f"avg_edge={avg_edge:+.3f} paper_pnl={self._paper_pnl:+.2f}{calib_part}"
         )
 
     def _best_signal(
@@ -275,16 +331,25 @@ class FairValueShadowTracker:
         ctx: LoopContext,
         estimate: FairValueEstimate,
     ) -> Optional[ShadowSignal]:
+        min_ask = config.SNIPE_FV_MIN_ASK
         candidates: list[tuple[str, float, float, float]] = []
         up_ask = ctx.tick.up.get("ask")
         up_size = ctx.tick.up.get("ask_size") or 0.0
-        if self._valid_ask(up_ask) and up_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE:
+        if (
+            self._valid_ask(up_ask)
+            and float(up_ask) >= min_ask
+            and up_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE
+        ):
             edge = estimate.p_up - float(up_ask)
             candidates.append(("up", float(up_ask), estimate.p_up, edge))
 
         down_ask = ctx.tick.down.get("ask")
         down_size = ctx.tick.down.get("ask_size") or 0.0
-        if self._valid_ask(down_ask) and down_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE:
+        if (
+            self._valid_ask(down_ask)
+            and float(down_ask) >= min_ask
+            and down_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE
+        ):
             edge = estimate.p_down - float(down_ask)
             candidates.append(("down", float(down_ask), estimate.p_down, edge))
 
@@ -356,6 +421,113 @@ class FairValueShadowTracker:
                 "result": result,
                 "paper_pnl_usd": paper_pnl,
             })
+
+    def _init_calibration_csv(self) -> None:
+        assert self._calibration_path is not None
+        self._calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._calibration_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=CALIBRATION_FIELDS).writeheader()
+
+    def _maybe_log_calibration(
+        self,
+        ctx: LoopContext,
+        estimate: FairValueEstimate,
+    ) -> None:
+        if (
+            self._calibration_path is None
+            or not config.SNIPE_FV_CALIBRATION_ENABLED
+        ):
+            return
+        slug = ctx.window.slug
+        now = time.monotonic()
+        last = self._last_calibration_at.get(slug, 0.0)
+        if (
+            last
+            and now - last < config.SNIPE_FV_CALIBRATION_INTERVAL_S
+        ):
+            return
+        self._last_calibration_at[slug] = now
+        self._calibrated_windows.add(slug)
+        self._calibration_rows += 1
+
+        up_ask = ctx.tick.up.get("ask")
+        up_size = ctx.tick.up.get("ask_size")
+        down_ask = ctx.tick.down.get("ask")
+        down_size = ctx.tick.down.get("ask_size")
+        up_edge = (
+            estimate.p_up - float(up_ask) if self._valid_ask(up_ask) else None
+        )
+        down_edge = (
+            estimate.p_down - float(down_ask) if self._valid_ask(down_ask) else None
+        )
+
+        self._write_calibration_row({
+            "ts_iso": ctx.tick.ts_utc.isoformat(),
+            "window_slug": slug,
+            "kind": "tick",
+            "seconds_remaining": f"{ctx.tick.seconds_remaining:.2f}",
+            "distance_usd": f"{estimate.distance_usd:+.2f}",
+            "expected_move_usd": f"{estimate.expected_move_usd:.2f}",
+            "sigma_usd_per_sqrt_s": f"{estimate.sigma_usd_per_sqrt_s:.4f}",
+            "p_up": f"{estimate.p_up:.4f}",
+            "p_down": f"{estimate.p_down:.4f}",
+            "up_ask": _fmt_opt(up_ask, ".4f"),
+            "up_ask_size": _fmt_opt(up_size, ".2f"),
+            "up_edge": _fmt_signed(up_edge),
+            "down_ask": _fmt_opt(down_ask, ".4f"),
+            "down_ask_size": _fmt_opt(down_size, ".2f"),
+            "down_edge": _fmt_signed(down_edge),
+            "total_mid": _fmt_opt(ctx.tick.total_mid, ".4f"),
+            "leader_side": ctx.tick.leader_side or "",
+            "resolved_side": "",
+            "final_up_mid": "",
+            "final_down_mid": "",
+        })
+
+    def _log_calibration_close(
+        self,
+        acc: WindowAccumulator,
+        resolved: str,
+    ) -> None:
+        if (
+            self._calibration_path is None
+            or not config.SNIPE_FV_CALIBRATION_ENABLED
+        ):
+            return
+        if acc.window.slug not in self._calibrated_windows:
+            return
+        last_tick = acc.last_tick
+        self._write_calibration_row({
+            "ts_iso": datetime.now(timezone.utc).isoformat(),
+            "window_slug": acc.window.slug,
+            "kind": "close",
+            "seconds_remaining": "0.00",
+            "distance_usd": "",
+            "expected_move_usd": "",
+            "sigma_usd_per_sqrt_s": "",
+            "p_up": "",
+            "p_down": "",
+            "up_ask": "",
+            "up_ask_size": "",
+            "up_edge": "",
+            "down_ask": "",
+            "down_ask_size": "",
+            "down_edge": "",
+            "total_mid": "",
+            "leader_side": "",
+            "resolved_side": resolved,
+            "final_up_mid": (
+                _fmt_opt(last_tick.up.get("mid"), ".4f") if last_tick is not None else ""
+            ),
+            "final_down_mid": (
+                _fmt_opt(last_tick.down.get("mid"), ".4f") if last_tick is not None else ""
+            ),
+        })
+
+    def _write_calibration_row(self, row: dict) -> None:
+        assert self._calibration_path is not None
+        with open(self._calibration_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=CALIBRATION_FIELDS).writerow(row)
 
     @staticmethod
     def _valid_ask(value: object) -> bool:

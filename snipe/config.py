@@ -117,6 +117,20 @@ SNIPE_FV_MIN_EXPECTED_MOVE_USD = float(
 )
 SNIPE_FV_SUMMARY_INTERVAL_S = float(os.getenv("SNIPE_FV_SUMMARY_INTERVAL_S", "60.0"))
 
+# Underdog filter: ignore shadow signals with an ask below this floor.
+# The first FV deployment showed a 15% win rate at avg entry 0.28 -- the
+# market is pricing those underdogs smarter than our naive model.  Set
+# to 0 to disable.
+SNIPE_FV_MIN_ASK = float(os.getenv("SNIPE_FV_MIN_ASK", "0.50"))
+
+# Calibration logger: write every evaluable tick (no edge filter) plus a
+# per-window resolution row, so we can build a calibration curve offline
+# and find regimes where the model has any edge at all.
+SNIPE_FV_CALIBRATION_ENABLED = _bool_env("SNIPE_FV_CALIBRATION_ENABLED", "true")
+SNIPE_FV_CALIBRATION_INTERVAL_S = float(
+    os.getenv("SNIPE_FV_CALIBRATION_INTERVAL_S", "1.0")
+)
+
 
 # ── Pre-submit book guard ───────────────────────────────────
 # Re-read the live CLOB book immediately before submitting a FAK order.

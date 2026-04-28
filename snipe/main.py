@@ -146,12 +146,15 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         "ref_required": config.SNIPE_REQUIRE_REF_FEED,
         "fv_shadow_enabled": config.SNIPE_FV_SHADOW_ENABLED,
         "fv_min_edge": config.SNIPE_FV_MIN_EDGE,
+        "fv_min_ask": config.SNIPE_FV_MIN_ASK,
         "fv_window_s": (
             config.SNIPE_FV_MIN_SECONDS_REMAINING,
             config.SNIPE_FV_MAX_SECONDS_REMAINING,
         ),
         "fv_vol_lookback_s": config.SNIPE_FV_VOL_LOOKBACK_S,
         "fv_fallback_vol_usd_per_sqrt_s": config.SNIPE_FV_FALLBACK_VOL_USD_PER_SQRT_S,
+        "fv_calibration_enabled": config.SNIPE_FV_CALIBRATION_ENABLED,
+        "fv_calibration_interval_s": config.SNIPE_FV_CALIBRATION_INTERVAL_S,
         "presubmit_min_ask_price": config.SNIPE_PRESUBMIT_MIN_ASK_PRICE,
         "dry_run": config.SNIPE_DRY_RUN,
         "enable_live": config.SNIPE_ENABLE_LIVE,
@@ -532,12 +535,15 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     ticks_path, windows_path = setup_csv_writers(session_ts=session_ts)
     signal_csv = data_dir / f"btc5m_snipe_signals_{session_ts}.csv"
     fv_csv = data_dir / f"btc5m_fv_shadow_{session_ts}.csv"
+    fv_calibration_csv = data_dir / f"btc5m_fv_calibration_{session_ts}.csv"
 
     out(f"  Tick log:      {ticks_path}")
     out(f"  Window log:    {windows_path}")
     out(f"  Signal log:    {signal_csv}")
     if config.SNIPE_FV_SHADOW_ENABLED:
         out(f"  FV log:        {fv_csv}")
+        if config.SNIPE_FV_CALIBRATION_ENABLED:
+            out(f"  FV calib log:  {fv_calibration_csv}")
     if args.duration is not None:
         out(f"  Duration:      {args.duration:.1f} min")
     out()
@@ -572,10 +578,22 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         f"directional: {config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT}")
     fv_tracker: Optional[FairValueShadowTracker] = None
     if config.SNIPE_FV_SHADOW_ENABLED:
-        fv_tracker = FairValueShadowTracker(ref_feed=ref_feed, csv_path=fv_csv, out=out)
+        calibration_path = (
+            fv_calibration_csv if config.SNIPE_FV_CALIBRATION_ENABLED else None
+        )
+        fv_tracker = FairValueShadowTracker(
+            ref_feed=ref_feed,
+            csv_path=fv_csv,
+            out=out,
+            calibration_path=calibration_path,
+        )
         out(f"  [fv] shadow enabled edge>={config.SNIPE_FV_MIN_EDGE:.3f} "
+            f"min_ask>={config.SNIPE_FV_MIN_ASK:.2f} "
             f"window={config.SNIPE_FV_MIN_SECONDS_REMAINING:.1f}-"
             f"{config.SNIPE_FV_MAX_SECONDS_REMAINING:.1f}s")
+        if calibration_path is not None:
+            out(f"  [fv] calibration logger active "
+                f"interval={config.SNIPE_FV_CALIBRATION_INTERVAL_S:.1f}s")
     out()
 
     try:
@@ -612,6 +630,8 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     out(f"  Signals:  {signal_csv}")
     if fv_tracker is not None:
         out(f"  FV log:   {fv_csv}")
+        if config.SNIPE_FV_CALIBRATION_ENABLED:
+            out(f"  FV calib: {fv_calibration_csv}")
     return 0
 
 
