@@ -129,10 +129,10 @@ class PolymarketClient:
                 key=config.POLY_PRIVATE_KEY,
                 signature_type=2,
             )
-            if hasattr(l1_client, "create_or_derive_api_key"):
-                raw_creds = l1_client.create_or_derive_api_key()
-            else:
-                raw_creds = l1_client.derive_api_key()
+            # V2's create_or_derive_api_key() logs a scary but benign ERROR
+            # when key creation fails before falling back.  We only need the
+            # deterministic IP-bound key here, so derive it directly.
+            raw_creds = l1_client.derive_api_key()
 
             if isinstance(raw_creds, dict):
                 api_key = raw_creds.get("apiKey") or raw_creds.get("api_key")
