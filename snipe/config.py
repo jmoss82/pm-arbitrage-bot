@@ -96,6 +96,28 @@ SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT = _bool_env(
 SNIPE_REQUIRE_REF_FEED = _bool_env("SNIPE_REQUIRE_REF_FEED", "true")
 
 
+# ── Fair-value shadow model ─────────────────────────────────
+# Passive research model.  It never submits orders; it only logs/prints
+# hypothetical entries when model fair value exceeds the current book ask
+# by at least SNIPE_FV_MIN_EDGE.
+SNIPE_FV_SHADOW_ENABLED = _bool_env("SNIPE_FV_SHADOW_ENABLED", "true")
+SNIPE_FV_MIN_EDGE = float(os.getenv("SNIPE_FV_MIN_EDGE", "0.05"))
+SNIPE_FV_MIN_SECONDS_REMAINING = float(
+    os.getenv("SNIPE_FV_MIN_SECONDS_REMAINING", "1.0")
+)
+SNIPE_FV_MAX_SECONDS_REMAINING = float(
+    os.getenv("SNIPE_FV_MAX_SECONDS_REMAINING", "120.0")
+)
+SNIPE_FV_VOL_LOOKBACK_S = float(os.getenv("SNIPE_FV_VOL_LOOKBACK_S", "60.0"))
+SNIPE_FV_FALLBACK_VOL_USD_PER_SQRT_S = float(
+    os.getenv("SNIPE_FV_FALLBACK_VOL_USD_PER_SQRT_S", "4.0")
+)
+SNIPE_FV_MIN_EXPECTED_MOVE_USD = float(
+    os.getenv("SNIPE_FV_MIN_EXPECTED_MOVE_USD", "1.0")
+)
+SNIPE_FV_SUMMARY_INTERVAL_S = float(os.getenv("SNIPE_FV_SUMMARY_INTERVAL_S", "60.0"))
+
+
 # ── Pre-submit book guard ───────────────────────────────────
 # Re-read the live CLOB book immediately before submitting a FAK order.
 # A large "favorable" move between signal and submit (e.g. signal at 0.98,

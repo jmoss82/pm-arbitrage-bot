@@ -38,6 +38,7 @@ from polymarket_client import PolymarketClient
 
 from . import config, positions as positions_mod
 from .executor import execute_entry
+from .fair_value import FairValueShadowTracker
 from .loop import LoopContext, run_window_loop
 from .monitor import (
     make_new_window_announcer,
@@ -143,6 +144,14 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         "ref_stale_s": config.SNIPE_REF_STALE_S,
         "ref_require_directional_agreement": config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT,
         "ref_required": config.SNIPE_REQUIRE_REF_FEED,
+        "fv_shadow_enabled": config.SNIPE_FV_SHADOW_ENABLED,
+        "fv_min_edge": config.SNIPE_FV_MIN_EDGE,
+        "fv_window_s": (
+            config.SNIPE_FV_MIN_SECONDS_REMAINING,
+            config.SNIPE_FV_MAX_SECONDS_REMAINING,
+        ),
+        "fv_vol_lookback_s": config.SNIPE_FV_VOL_LOOKBACK_S,
+        "fv_fallback_vol_usd_per_sqrt_s": config.SNIPE_FV_FALLBACK_VOL_USD_PER_SQRT_S,
         "presubmit_min_ask_price": config.SNIPE_PRESUBMIT_MIN_ASK_PRICE,
         "dry_run": config.SNIPE_DRY_RUN,
         "enable_live": config.SNIPE_ENABLE_LIVE,
@@ -522,10 +531,13 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     ticks_path, windows_path = setup_csv_writers(session_ts=session_ts)
     signal_csv = data_dir / f"btc5m_snipe_signals_{session_ts}.csv"
+    fv_csv = data_dir / f"btc5m_fv_shadow_{session_ts}.csv"
 
     out(f"  Tick log:      {ticks_path}")
     out(f"  Window log:    {windows_path}")
     out(f"  Signal log:    {signal_csv}")
+    if config.SNIPE_FV_SHADOW_ENABLED:
+        out(f"  FV log:        {fv_csv}")
     if args.duration is not None:
         out(f"  Duration:      {args.duration:.1f} min")
     out()
@@ -558,18 +570,26 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     out(f"         min distance: ${config.SNIPE_MIN_REF_DISTANCE_USD:.2f}  "
         f"stale cutoff: {config.SNIPE_REF_STALE_S:.1f}s  "
         f"directional: {config.SNIPE_REF_REQUIRE_DIRECTIONAL_AGREEMENT}")
+    fv_tracker: Optional[FairValueShadowTracker] = None
+    if config.SNIPE_FV_SHADOW_ENABLED:
+        fv_tracker = FairValueShadowTracker(ref_feed=ref_feed, csv_path=fv_csv, out=out)
+        out(f"  [fv] shadow enabled edge>={config.SNIPE_FV_MIN_EDGE:.3f} "
+            f"window={config.SNIPE_FV_MIN_SECONDS_REMAINING:.1f}-"
+            f"{config.SNIPE_FV_MAX_SECONDS_REMAINING:.1f}s")
     out()
 
     try:
         await run_window_loop(
             poly,
             on_tick=[
+                *([fv_tracker.on_tick] if fv_tracker is not None else []),
                 make_scanner_handler(session_state, dry_run, signal_csv, ref_feed=ref_feed),
                 make_tick_csv_handler(ticks_path),
                 make_tty_handler(),
                 make_settler_handler(),
             ],
             on_window_end=[
+                *([fv_tracker.on_window_end] if fv_tracker is not None else []),
                 make_window_csv_handler(windows_path),
             ],
             on_new_window=make_new_window_announcer(),
@@ -582,12 +602,16 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
     out()
     out("  Final settlement sweep...")
+    if fv_tracker is not None:
+        fv_tracker.print_summary(force=True)
     summary = await settle_open_positions(verbose=True)
     out(f"  Settled on shutdown: {summary['settled']} (pending {summary['pending']}, errors {summary['errors']})")
     out()
     out(f"  Ticks:    {ticks_path}")
     out(f"  Windows:  {windows_path}")
     out(f"  Signals:  {signal_csv}")
+    if fv_tracker is not None:
+        out(f"  FV log:   {fv_csv}")
     return 0
 
 
