@@ -332,12 +332,13 @@ class FairValueShadowTracker:
         estimate: FairValueEstimate,
     ) -> Optional[ShadowSignal]:
         min_ask = config.SNIPE_FV_MIN_ASK
+        max_ask = config.SNIPE_FV_MAX_ASK
         candidates: list[tuple[str, float, float, float]] = []
         up_ask = ctx.tick.up.get("ask")
         up_size = ctx.tick.up.get("ask_size") or 0.0
         if (
             self._valid_ask(up_ask)
-            and float(up_ask) >= min_ask
+            and min_ask <= float(up_ask) < max_ask
             and up_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE
         ):
             edge = estimate.p_up - float(up_ask)
@@ -347,7 +348,7 @@ class FairValueShadowTracker:
         down_size = ctx.tick.down.get("ask_size") or 0.0
         if (
             self._valid_ask(down_ask)
-            and float(down_ask) >= min_ask
+            and min_ask <= float(down_ask) < max_ask
             and down_size >= config.SNIPE_MIN_TOP_OF_BOOK_SIZE
         ):
             edge = estimate.p_down - float(down_ask)

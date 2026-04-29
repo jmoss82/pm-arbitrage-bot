@@ -147,6 +147,7 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         "fv_shadow_enabled": config.SNIPE_FV_SHADOW_ENABLED,
         "fv_min_edge": config.SNIPE_FV_MIN_EDGE,
         "fv_min_ask": config.SNIPE_FV_MIN_ASK,
+        "fv_max_ask": config.SNIPE_FV_MAX_ASK,
         "fv_window_s": (
             config.SNIPE_FV_MIN_SECONDS_REMAINING,
             config.SNIPE_FV_MAX_SECONDS_REMAINING,
@@ -588,7 +589,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             calibration_path=calibration_path,
         )
         out(f"  [fv] shadow enabled edge>={config.SNIPE_FV_MIN_EDGE:.3f} "
-            f"min_ask>={config.SNIPE_FV_MIN_ASK:.2f} "
+            f"ask in [{config.SNIPE_FV_MIN_ASK:.2f}, {config.SNIPE_FV_MAX_ASK:.2f}) "
             f"window={config.SNIPE_FV_MIN_SECONDS_REMAINING:.1f}-"
             f"{config.SNIPE_FV_MAX_SECONDS_REMAINING:.1f}s")
         if calibration_path is not None:

@@ -123,6 +123,13 @@ SNIPE_FV_SUMMARY_INTERVAL_S = float(os.getenv("SNIPE_FV_SUMMARY_INTERVAL_S", "60
 # to 0 to disable.
 SNIPE_FV_MIN_ASK = float(os.getenv("SNIPE_FV_MIN_ASK", "0.50"))
 
+# Overconfident-favorite filter: ignore signals with an ask AT OR ABOVE this
+# ceiling.  The Apr-29 calibration analysis showed the [0.75, 0.85) entry
+# bucket lost money (model overshoots probability there).  Buckets above 0.85
+# do work but the upside is small and they rarely fire under tighter edge
+# filters anyway.  Set to 1.0 to disable.
+SNIPE_FV_MAX_ASK = float(os.getenv("SNIPE_FV_MAX_ASK", "0.75"))
+
 # Calibration logger: write every evaluable tick (no edge filter) plus a
 # per-window resolution row, so we can build a calibration curve offline
 # and find regimes where the model has any edge at all.

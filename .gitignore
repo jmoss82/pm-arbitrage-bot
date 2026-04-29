@@ -10,6 +10,7 @@ __pycache__/
 data/
 logs/
 archive/
+analysis/
 .venv/
 venv/
 .DS_Store
